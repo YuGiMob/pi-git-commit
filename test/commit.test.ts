@@ -1,4 +1,8 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   Type: {
@@ -211,6 +215,13 @@ describe("commit extension", () => {
       expect(await isBlocked("git fetch origin")).toBe(false);
     });
 
+    it("blocks git fetch --prune", async () => {
+      expect(await isBlocked("git fetch --prune")).toBe(true);
+      expect(await isBlocked("git fetch -p origin")).toBe(true);
+      expect(await isBlocked("git fetch --prune-tags")).toBe(true);
+      expect(await isBlocked("git fetch --all --prune")).toBe(true);
+    });
+
     it("allows git status", async () => {
       expect(await isBlocked("git status")).toBe(false);
     });
@@ -303,8 +314,166 @@ describe("commit extension", () => {
       expect(await isBlocked("ls -la")).toBe(false);
     });
 
-    it("blocks commands mentioning git commands even in strings", async () => {
-      expect(await isBlocked("echo 'git add is dangerous'")).toBe(true);
+    it("allows git commands mentioned inside strings", async () => {
+      expect(await isBlocked("echo 'git add is dangerous'")).toBe(false);
+      expect(await isBlocked("grep -rn 'git push' docs")).toBe(false);
+    });
+
+    it("allows git commands inside heredocs", async () => {
+      const script = `cat > deploy.sh <<'EOF'
+git push origin main
+git commit -m x
+EOF`;
+      expect(await isBlocked(script)).toBe(false);
+    });
+
+    it("allows git in command substitution for read-only commands", async () => {
+      expect(await isBlocked("echo $(git rev-parse HEAD)")).toBe(false);
+    });
+
+    it("blocks git with -C directory", async () => {
+      expect(await isBlocked("git -C /tmp/repo commit -m x")).toBe(true);
+    });
+
+    it("blocks git with -c config overrides", async () => {
+      expect(await isBlocked("git -c user.name=x commit -m y")).toBe(true);
+      expect(await isBlocked("git -c core.hooksPath=/tmp/hooks commit -m y")).toBe(true);
+    });
+
+    it("blocks git with --git-dir and --work-tree", async () => {
+      expect(await isBlocked("git --git-dir=/tmp/gitdir push")).toBe(true);
+      expect(await isBlocked("git --work-tree=/tmp commit")).toBe(true);
+    });
+
+    it("blocks uppercase GIT", async () => {
+      expect(await isBlocked("GIT add .")).toBe(true);
+    });
+
+    it("blocks history rewrites and object maintenance", async () => {
+      expect(await isBlocked("git filter-branch --all")).toBe(true);
+      expect(await isBlocked("git filter-repo --force")).toBe(true);
+      expect(await isBlocked("git fast-import < dump")).toBe(true);
+      expect(await isBlocked("git prune")).toBe(true);
+      expect(await isBlocked("git repack -a")).toBe(true);
+      expect(await isBlocked("git pack-refs --all")).toBe(true);
+      expect(await isBlocked("git reflog expire --all")).toBe(true);
+    });
+
+    it("allows git reflog show", async () => {
+      expect(await isBlocked("git reflog show HEAD")).toBe(false);
+      expect(await isBlocked("git reflog")).toBe(false);
+    });
+
+    it("blocks git subtree, bisect and mergetool", async () => {
+      expect(await isBlocked("git subtree push origin main")).toBe(true);
+      expect(await isBlocked("git subtree add --prefix=lib https://example.com/repo.git main")).toBe(true);
+      expect(await isBlocked("git bisect reset")).toBe(true);
+      expect(await isBlocked("git mergetool")).toBe(true);
+    });
+
+    it("blocks git behind sudo and in sh -c", async () => {
+      expect(await isBlocked("sudo git push origin main")).toBe(true);
+      expect(await isBlocked('sh -c "git push origin main"')).toBe(true);
+      expect(await isBlocked("bash -c 'git add .'")).toBe(true);
+    });
+
+    it("blocks git in command substitution and after background operators", async () => {
+      expect(await isBlocked("echo $(git push origin main)")).toBe(true);
+      expect(await isBlocked("npm run build & git push")).toBe(true);
+    });
+
+    it("blocks git checkout -- . and directory restores", async () => {
+      expect(await isBlocked("git checkout -- .")).toBe(true);
+      expect(await isBlocked("git checkout -- src/")).toBe(true);
+    });
+
+    it("blocks mutative commands in mixed pipelines", async () => {
+      expect(await isBlocked("git status && git push")).toBe(true);
+      expect(await isBlocked("git config --list && git fetch origin")).toBe(false);
+    });
+
+    it("allows non-git binaries with git-like names", async () => {
+      expect(await isBlocked("mygit commit")).toBe(false);
+      expect(await isBlocked("git-upload-pack")).toBe(false);
+    });
+
+    it("blocks path-qualified git invocations", async () => {
+      expect(await isBlocked("/usr/bin/git push")).toBe(true);
+      expect(await isBlocked("./git commit -m x")).toBe(true);
+      expect(await isBlocked("sudo /usr/bin/git push")).toBe(true);
+    });
+
+    it("blocks git behind wrapper prefixes with flags", async () => {
+      expect(await isBlocked("sudo -u root git push origin main")).toBe(true);
+      expect(await isBlocked("sudo -u git push")).toBe(true);
+      expect(await isBlocked("nice -n 5 git push")).toBe(true);
+      expect(await isBlocked("env -i git push")).toBe(true);
+      expect(await isBlocked("time -p git push")).toBe(true);
+      expect(await isBlocked("timeout 5 git push")).toBe(true);
+      expect(await isBlocked("doas -u root git add .")).toBe(true);
+    });
+
+    it("blocks git with env var assignments", async () => {
+      expect(await isBlocked("VAR=1 git push origin main")).toBe(true);
+      expect(await isBlocked("env VAR=1 git push")).toBe(true);
+      expect(await isBlocked("GIT_CONFIG=/tmp/cfg git commit -m x")).toBe(true);
+      expect(await isBlocked('FOO="a b" git push')).toBe(true);
+      expect(await isBlocked("FOO=bar ls -la")).toBe(false);
+    });
+
+    it("allows non-git commands behind wrapper prefixes with flags", async () => {
+      expect(await isBlocked("sudo -u root ls -la")).toBe(false);
+      expect(await isBlocked("nice -n 5 make")).toBe(false);
+      expect(await isBlocked("timeout 5 ls")).toBe(false);
+    });
+
+    it("blocks git in shell control constructs", async () => {
+      expect(await isBlocked("{ git push; }")).toBe(true);
+      expect(await isBlocked("! git push")).toBe(true);
+      expect(await isBlocked("if git push; then :; fi")).toBe(true);
+      expect(await isBlocked("while git push; do :; done")).toBe(true);
+      expect(await isBlocked("then git push")).toBe(true);
+    });
+
+    it("blocks git in process substitution", async () => {
+      expect(await isBlocked("cat <(git push)")).toBe(true);
+      expect(await isBlocked("diff <(git show HEAD) <(git push)")).toBe(true);
+    });
+
+    it("blocks git behind su -c", async () => {
+      expect(await isBlocked('su -c "git push origin main"')).toBe(true);
+      expect(await isBlocked("su - -c 'git add .'")).toBe(true);
+      expect(await isBlocked("su root -c git push")).toBe(true);
+      expect(await isBlocked('su -c "echo hi"')).toBe(false);
+    });
+
+    it("blocks tag creation", async () => {
+      expect(await isBlocked("git tag v1.0")).toBe(true);
+      expect(await isBlocked('git tag -m "msg" v1.0')).toBe(true);
+      expect(await isBlocked("git tag -a v1.0 -m msg")).toBe(true);
+    });
+
+    it("allows tag listing", async () => {
+      expect(await isBlocked("git tag -l")).toBe(false);
+      expect(await isBlocked("git tag --list 'v*'")).toBe(false);
+      expect(await isBlocked("git tag --contains HEAD")).toBe(false);
+      expect(await isBlocked("git tag --sort=-creatordate")).toBe(false);
+      expect(await isBlocked("git tag -n5")).toBe(false);
+    });
+
+    it("blocks git config read flags combined with write flags", async () => {
+      expect(await isBlocked("git config --get --add x y")).toBe(true);
+      expect(await isBlocked("git config --list --unset x")).toBe(true);
+    });
+
+    it("blocks git branch --prune and upstream changes", async () => {
+      expect(await isBlocked("git branch --prune")).toBe(true);
+      expect(await isBlocked("git branch --set-upstream-to=origin/main")).toBe(true);
+    });
+
+    it("blocks multi-path checkout restores", async () => {
+      expect(await isBlocked("git checkout -- a b c")).toBe(true);
+      expect(await isBlocked("git checkout -- a.txt")).toBe(false);
     });
   });
 
@@ -320,6 +489,7 @@ describe("commit extension", () => {
 
     it("has a message parameter", () => {
       expect(capturedTool.parameters.message).toBeDefined();
+      expect(capturedTool.parameters.message.minLength).toBe(1);
     });
   });
 
@@ -409,6 +579,70 @@ describe("commit extension", () => {
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Nothing to commit"), "warning");
       expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
+    });
+  });
+
+  describe("git_commit tool integration (real git)", () => {
+    let tempDir: string;
+    let tool: any;
+
+    const runGit = (args: string[]) => {
+      const result = spawnSync("git", args, { cwd: tempDir, encoding: "utf-8" });
+      return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    };
+
+    beforeEach(async () => {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-git-commit-"));
+      runGit(["init", "-b", "main"]);
+      runGit(["config", "user.name", "Test User"]);
+      runGit(["config", "user.email", "test@example.com"]);
+      runGit(["config", "commit.gpgsign", "false"]);
+
+      vi.resetModules();
+      const mod = await import("../index.js");
+      const fakePi: any = {
+        on: vi.fn(),
+        registerTool: vi.fn((registered: any) => {
+          tool = registered;
+        }),
+        registerCommand: vi.fn(),
+        getActiveTools: vi.fn(() => []),
+        setActiveTools: vi.fn(),
+        sendUserMessage: vi.fn(),
+        exec: (command: string, args: string[], opts?: { cwd?: string }) => {
+          const result = spawnSync(command, args, { cwd: opts?.cwd ?? tempDir, encoding: "utf-8" });
+          return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+        },
+      };
+      mod.default(fakePi);
+    });
+
+    afterEach(() => {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("stages all changes and commits with the TYPE: prefix", async () => {
+      fs.writeFileSync(path.join(tempDir, "a.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "add a.txt" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("FIX: add a.txt");
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: add a.txt");
+      expect(runGit(["status", "--porcelain"]).stdout.trim()).toBe("");
+    });
+
+    it("reports a failed commit as a tool error", async () => {
+      fs.writeFileSync(path.join(tempDir, "b.txt"), "hello");
+      runGit(["add", "."]);
+      runGit(["commit", "-m", "seed"]);
+      const result = await tool.execute("call-1", { type: "IMPROVE", message: "no changes" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Commit failed");
+    });
+
+    it("rejects an empty commit message", async () => {
+      const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("empty");
     });
   });
 });

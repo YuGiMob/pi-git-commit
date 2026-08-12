@@ -6,47 +6,182 @@ const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
 export default function (pi: ExtensionAPI) {
   let gitBlocked = true;
 
-  const containsBlockedGitCommand = (command: string): boolean => {
-    const alwaysBlocked = /\bgit\s+(add|commit|push|pull|merge|rebase|reset|clean|rm|restore|switch|cherry-pick|revert|mv|init|clone)\b/;
-    if (alwaysBlocked.test(command)) return true;
+  const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec"]);
+  const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
 
-    const readOnlyForms = [
-      /\bgit\s+fetch\b/,
-      /\bgit\s+stash\s+(list|show)\b/,
-      /\bgit\s+remote\s*$/,
-      /\bgit\s+config\s+(--list|-l|--get|--get-all|--get-regexp|--show-origin|--show-scope)\b/,
-      /\bgit\s+remote\s+(-v|show|get-url)\b/,
-      /\bgit\s+apply\s+--(check|stat)\b/,
-      /\bgit\s+notes\s+(list|show)\b/,
-      /\bgit\s+lfs\s+(ls-files|status)\b/,
-      /\bgit\s+sparse-checkout\s+list\b/,
-    ];
-    if (readOnlyForms.some((re) => re.test(command))) return false;
+  const GIT_META_OPTS = new Set(["--help", "-h", "--version"]);
+  const GIT_OPTS_BARE = new Set(["--bare", "-p", "--paginate", "--no-pager", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks", "--html-path", "--man-path", "--info-path"]);
+  const GIT_OPTS_WITH_ARG = new Set(["-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix", "--shallow-file", "--template", "--upload-pack"]);
 
-    if (/\bgit\s+(config|remote|apply|am|notes|replace|update-ref|symbolic-ref|update-index|gc|maintenance|sparse-checkout|lfs)\b/.test(command)) return true;
+  const blockAll = () => true;
+  const hasAny = (args: string[], values: string[]) => values.some((value) => args.includes(value));
+  const allowOnly = (values: string[]) => (args: string[]) => !hasAny(args, values);
 
-    if (/\bgit\s+branch\b/.test(command)) {
-      if (/\bgit\s+branch\s+(-d|-D|-m|-M|--delete|--move)\b/.test(command)) return true;
-      return false;
+  const GIT_RULES: Record<string, (args: string[]) => boolean> = {
+    add: blockAll,
+    commit: blockAll,
+    push: blockAll,
+    pull: blockAll,
+    merge: blockAll,
+    rebase: blockAll,
+    reset: blockAll,
+    clean: blockAll,
+    rm: blockAll,
+    restore: blockAll,
+    switch: blockAll,
+    "cherry-pick": blockAll,
+    revert: blockAll,
+    mv: blockAll,
+    init: blockAll,
+    clone: blockAll,
+    am: blockAll,
+    replace: blockAll,
+    "update-ref": blockAll,
+    "symbolic-ref": blockAll,
+    "update-index": blockAll,
+    gc: blockAll,
+    maintenance: blockAll,
+    "filter-branch": blockAll,
+    "filter-repo": blockAll,
+    "fast-import": blockAll,
+    prune: blockAll,
+    repack: blockAll,
+    "pack-refs": blockAll,
+    mergetool: blockAll,
+    bisect: blockAll,
+    subtree: blockAll,
+    fetch: (args) => hasAny(args, ["--prune", "-p", "-P", "--prune-tags"]),
+    config: (args) => {
+      if (hasAny(args, ["--add", "--unset", "--unset-all", "--replace-all", "--remove-section", "--rename-section", "--edit", "-e"])) return true;
+      return !hasAny(args, ["--list", "-l", "--get", "--get-all", "--get-regexp", "--show-origin", "--show-scope"]);
+    },
+    remote: (args) => !(args.length === 0 || args.includes("-v") || hasAny(args, ["show", "get-url"])),
+    apply: allowOnly(["--check", "--stat"]),
+    notes: allowOnly(["list", "show"]),
+    lfs: allowOnly(["ls-files", "status"]),
+    "sparse-checkout": allowOnly(["list"]),
+    stash: allowOnly(["list", "show"]),
+    submodule: allowOnly(["status", "init", "summary"]),
+    worktree: allowOnly(["list"]),
+    reflog: (args) => !(args.length === 0 || hasAny(args, ["show"])),
+    branch: (args) => args.some((arg) => ["-d", "-m", "--delete", "--move", "--prune", "--unset-upstream", "--edit-description"].includes(arg) || arg.startsWith("--set-upstream-to")),
+    tag: (args) => {
+      if (args.length === 0) return false;
+      const first = args[0];
+      if (first === "-l" || first === "--list" || first.startsWith("-n")) return false;
+      return !["--contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--column", "--no-column", "--color", "--ignore-case", "--verbose", "-v"].some((flag) => first.startsWith(flag));
+    },
+    checkout: (args) => {
+      if (args[0] !== "--") return true;
+      const path = args[1];
+      if (path === undefined) return true;
+      if (args.length > 2) return true;
+      return path === "." || path === ".." || path.endsWith("/");
+    },
+  };
+
+  const maskHeredocBodies = (command: string): string => {
+    let masked = "";
+    let cursor = 0;
+    const heredocRe = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/g;
+    let match: RegExpExecArray | null;
+    while ((match = heredocRe.exec(command)) !== null) {
+      const current = match;
+      if (current.index < cursor) continue;
+      const tail = command.slice(current.index + current[0].length);
+      const lines = tail.split("\n");
+      const end = lines.findIndex((line) => line.trim() === current[1]);
+      if (end === -1) continue;
+      const body = lines.slice(0, end + 1);
+      masked += command.slice(cursor, current.index) + current[0] + body.map((line) => " ".repeat(line.length)).join("\n");
+      cursor = current.index + current[0].length + body.join("\n").length;
     }
+    return masked + command.slice(cursor);
+  };
 
-    if (/\bgit\s+tag\b/.test(command)) {
-      if (/\bgit\s+tag\s+(-d|-a|-s|-f|--delete|--annotate|--sign|--force)\b/.test(command)) return true;
-      return false;
+  const stripSurrounding = (segment: string): string => segment.replace(/^[\s'"(){}!]+/, "").replace(/[\s'"()!}]+$/, "");
+  const stripQuotes = (value: string): string => value.trim().replace(/^['"]/, "").replace(/['"]$/, "");
+
+  const stripEnvAssignments = (segment: string): string => {
+    let rest = segment;
+    for (;;) {
+      const match = rest.match(/^[A-Za-z_][A-Za-z0-9_]*=(?:(?:[^'"\s])|(?:'[^']*')|(?:"[^"]*"))*(?:\s|$)/);
+      if (!match) break;
+      rest = rest.slice(match[0].length).trimStart();
+      if (!rest) break;
     }
+    return rest;
+  };
 
-    if (/\bgit\s+checkout\s+--\s/.test(command)) return false;
-    if (/\bgit\s+checkout\b/.test(command)) return true;
+  const stripPrefixes = (segment: string): string => {
+    let rest = segment;
+    for (let i = 0; i < 5; i++) {
+      rest = stripEnvAssignments(rest);
+      if (!rest) break;
+      const match = rest.match(/^([A-Za-z_][A-Za-z0-9_]*)\b(?:\s|$)/);
+      if (!match) break;
+      const word = match[1].toLowerCase();
+      if (!PREFIXES.has(word) && !CONTROL_KEYWORDS.has(word)) break;
+      rest = rest.slice(match[0].length).trimStart();
+      if (!rest) break;
+      rest = rest.replace(/^\d+(?:\.\d+)?[a-z]*\s+/, "");
+      while (rest.startsWith("-")) {
+        const flag = rest.match(/^(\S+)(?:\s|$)/);
+        if (!flag) break;
+        rest = rest.slice(flag[0].length).trimStart();
+        if (!rest) break;
+        const next = rest.match(/^([^\s-][^\s]*)(?:\s|$)/);
+        if (!next) break;
+        const nextWord = next[1].toLowerCase();
+        if (nextWord === "git" || nextWord === "git.exe" || PREFIXES.has(nextWord) || CONTROL_KEYWORDS.has(nextWord)) break;
+        rest = rest.slice(next[0].length).trimStart();
+      }
+    }
+    return rest;
+  };
 
-    if (/\bgit\s+submodule\s+(status|init|summary)\b/.test(command)) return false;
-    if (/\bgit\s+submodule\b/.test(command)) return true;
+  const classifyGitCommand = (rest: string): boolean => {
+    const tokens = rest.toLowerCase().split(/\s+/).filter(Boolean);
+    let subcommand: string | undefined;
+    let subcommandIndex = -1;
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (GIT_META_OPTS.has(token)) return false;
+      if (GIT_OPTS_BARE.has(token)) continue;
+      if (GIT_OPTS_WITH_ARG.has(token)) {
+        i++;
+        continue;
+      }
+      if (token.startsWith("-")) continue;
+      subcommand = token;
+      subcommandIndex = i;
+      break;
+    }
+    if (subcommand === undefined) return false;
+    const rule = GIT_RULES[subcommand];
+    if (!rule) return false;
+    return rule(tokens.slice(subcommandIndex + 1));
+  };
 
-    if (/\bgit\s+worktree\s+list\b/.test(command)) return false;
-    if (/\bgit\s+worktree\b/.test(command)) return true;
-
-    if (/\bgit\s+stash\b/.test(command)) return true;
-
-    return false;
+  const containsBlockedGitCommand = (command: string, depth = 0): boolean => {
+    if (depth > 4) return false;
+    const masked = maskHeredocBodies(command);
+    return masked.split(/\n|;|\|\||&&|\||&|`|\$\(|<\(|>\(/).some((segment) => {
+      let rest = stripSurrounding(segment.trim());
+      if (!rest) return false;
+      rest = stripPrefixes(rest);
+      rest = stripSurrounding(rest);
+      if (!rest) return false;
+      const shell = rest.match(/^(sh|bash|zsh|dash|ksh|ash|fish)\s+-[a-zA-Z]*c[a-zA-Z]*\s+(.+)$/i);
+      if (shell) return containsBlockedGitCommand(stripQuotes(shell[2]), depth + 1);
+      const su = rest.match(/^su\b(.*?)\s+-c\s+(.+)$/i);
+      if (su) return containsBlockedGitCommand(stripQuotes(su[2]), depth + 1);
+      const pwsh = rest.match(/^(pwsh|powershell)\s+(-Command|-c)\s+(.+)$/i);
+      if (pwsh) return containsBlockedGitCommand(stripQuotes(pwsh[3]), depth + 1);
+      const git = rest.match(/^(?:.*\/)?git(\.exe)?\b(.*)$/i);
+      if (!git) return false;
+      return classifyGitCommand(git[2]);
+    });
   };
 
   pi.on("tool_call", async (event) => {
@@ -70,13 +205,18 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       type: Type.Union(COMMIT_TYPES.map((t) => Type.Literal(t))),
       message: Type.String({
+        minLength: 1,
         description: "Commit message (imperative mood). Multi-line allowed for detailed changes.",
       }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 
       const { type, message } = params;
-      const fullMessage = `${type}: ${message}`;
+      const trimmedMessage = message.trim();
+      if (!trimmedMessage) {
+        return { content: [{ type: "text", text: "Commit message must not be empty." }], details: {}, isError: true };
+      }
+      const fullMessage = `${type}: ${trimmedMessage}`;
       const addResult = await pi.exec("git", ["add", "."], { signal });
       if (addResult.code !== 0) {
         return { content: [{ type: "text", text: `Staging failed: ${addResult.stderr}` }], details: {}, isError: true };
