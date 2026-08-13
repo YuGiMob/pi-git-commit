@@ -475,6 +475,78 @@ EOF`;
       expect(await isBlocked("git checkout -- a b c")).toBe(true);
       expect(await isBlocked("git checkout -- a.txt")).toBe(false);
     });
+
+    it("blocks git branch -u, -f, -c and --force", async () => {
+      expect(await isBlocked("git branch -u origin/main")).toBe(true);
+      expect(await isBlocked("git branch -f main HEAD")).toBe(true);
+      expect(await isBlocked("git branch -c copy")).toBe(true);
+      expect(await isBlocked("git branch --force main HEAD")).toBe(true);
+    });
+
+    it("blocks git stage and index/object plumbing", async () => {
+      expect(await isBlocked("git stage .")).toBe(true);
+      expect(await isBlocked("git read-tree HEAD")).toBe(true);
+      expect(await isBlocked("git checkout-index -a")).toBe(true);
+      expect(await isBlocked("git merge-file a b c")).toBe(true);
+      expect(await isBlocked("git prune-packed")).toBe(true);
+    });
+
+    it("blocks deeply nested sh -c wrappers (fail closed)", async () => {
+      const nested = `sh -c "`.repeat(5) + "git push" + `"`.repeat(5);
+      expect(await isBlocked(nested)).toBe(true);
+    });
+
+    it("blocks long wrapper prefix chains", async () => {
+      expect(await isBlocked("sudo sudo sudo sudo sudo sudo git push")).toBe(true);
+    });
+
+    it("blocks combined short flags and force variants on branch", async () => {
+      expect(await isBlocked("git branch -dv old-branch")).toBe(true);
+      expect(await isBlocked("git branch -D old-branch")).toBe(true);
+      expect(await isBlocked("git branch -M new-name")).toBe(true);
+      expect(await isBlocked("git branch -fu main HEAD")).toBe(true);
+    });
+
+    it("allows read-only branch flags", async () => {
+      expect(await isBlocked("git branch -v")).toBe(false);
+      expect(await isBlocked("git branch -vv")).toBe(false);
+      expect(await isBlocked("git branch -a")).toBe(false);
+      expect(await isBlocked("git branch -r")).toBe(false);
+    });
+
+    it("blocks branch creation", async () => {
+      expect(await isBlocked("git branch feature")).toBe(true);
+      expect(await isBlocked("git branch feature main")).toBe(true);
+      expect(await isBlocked("git branch -- feature")).toBe(true);
+      expect(await isBlocked("git branch -q feature")).toBe(true);
+      expect(await isBlocked("git branch -v feature")).toBe(true);
+      expect(await isBlocked("git branch -i feature")).toBe(true);
+      expect(await isBlocked("git branch --sort=name feature")).toBe(true);
+      expect(await isBlocked("git branch --format='%(refname)' feature")).toBe(true);
+      expect(await isBlocked("git branch --color feature")).toBe(true);
+      expect(await isBlocked("git branch --no-color feature")).toBe(true);
+    });
+
+    it("blocks branch -t and --track", async () => {
+      expect(await isBlocked("git branch -t feature")).toBe(true);
+      expect(await isBlocked("git branch --track feature")).toBe(true);
+    });
+
+    it("allows read-only branch listing with patterns", async () => {
+      expect(await isBlocked("git branch -l feature")).toBe(false);
+      expect(await isBlocked("git branch --list 'v*'")).toBe(false);
+      expect(await isBlocked("git branch --merged main")).toBe(false);
+      expect(await isBlocked("git branch --no-merged main")).toBe(false);
+      expect(await isBlocked("git branch --contains HEAD")).toBe(false);
+      expect(await isBlocked("git branch --no-contains HEAD")).toBe(false);
+      expect(await isBlocked("git branch --points-at HEAD")).toBe(false);
+      expect(await isBlocked("git branch --show-current")).toBe(false);
+    });
+
+    it("fails closed on deeply nested wrappers even without git", async () => {
+      const nested = `sh -c "`.repeat(5) + "ls" + `"`.repeat(5);
+      expect(await isBlocked(nested)).toBe(true);
+    });
   });
 
   describe("git_commit tool registration", () => {

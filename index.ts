@@ -16,9 +16,11 @@ export default function (pi: ExtensionAPI) {
   const blockAll = () => true;
   const hasAny = (args: string[], values: string[]) => values.some((value) => args.includes(value));
   const allowOnly = (values: string[]) => (args: string[]) => !hasAny(args, values);
+  const hasShortFlag = (args: string[], flags: string) => args.some((arg) => arg.startsWith("-") && !arg.startsWith("--") && arg.length > 1 && [...arg.slice(1)].some((flag) => flags.includes(flag)));
 
   const GIT_RULES: Record<string, (args: string[]) => boolean> = {
     add: blockAll,
+    stage: blockAll,
     commit: blockAll,
     push: blockAll,
     pull: blockAll,
@@ -39,6 +41,10 @@ export default function (pi: ExtensionAPI) {
     "update-ref": blockAll,
     "symbolic-ref": blockAll,
     "update-index": blockAll,
+    "read-tree": blockAll,
+    "checkout-index": blockAll,
+    "merge-file": blockAll,
+    "prune-packed": blockAll,
     gc: blockAll,
     maintenance: blockAll,
     "filter-branch": blockAll,
@@ -64,7 +70,13 @@ export default function (pi: ExtensionAPI) {
     submodule: allowOnly(["status", "init", "summary"]),
     worktree: allowOnly(["list"]),
     reflog: (args) => !(args.length === 0 || hasAny(args, ["show"])),
-    branch: (args) => args.some((arg) => ["-d", "-m", "--delete", "--move", "--prune", "--unset-upstream", "--edit-description"].includes(arg) || arg.startsWith("--set-upstream-to")),
+    branch: (args) => {
+      if (args.includes("--")) return true;
+      if (hasAny(args, ["--delete", "--move", "--copy", "--force", "--track", "--prune", "--unset-upstream", "--edit-description"]) || args.some((arg) => arg.startsWith("--set-upstream-to"))) return true;
+      if (hasShortFlag(args, "dmufcCDMt")) return true;
+      if (!args.some((arg) => !arg.startsWith("-"))) return false;
+      return !(hasAny(args, ["--list", "--merged", "--no-merged", "--contains", "--no-contains", "--points-at", "--show-current"]) || hasShortFlag(args, "lar"));
+    },
     tag: (args) => {
       if (args.length === 0) return false;
       const first = args[0];
@@ -115,7 +127,7 @@ export default function (pi: ExtensionAPI) {
 
   const stripPrefixes = (segment: string): string => {
     let rest = segment;
-    for (let i = 0; i < 5; i++) {
+    for (;;) {
       rest = stripEnvAssignments(rest);
       if (!rest) break;
       const match = rest.match(/^([A-Za-z_][A-Za-z0-9_]*)\b(?:\s|$)/);
@@ -164,7 +176,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const containsBlockedGitCommand = (command: string, depth = 0): boolean => {
-    if (depth > 4) return false;
+    if (depth > 4) return true;
     const masked = maskHeredocBodies(command);
     return masked.split(/\n|;|\|\||&&|\||&|`|\$\(|<\(|>\(/).some((segment) => {
       let rest = stripSurrounding(segment.trim());
@@ -186,8 +198,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return undefined;
-    const command = (event.input.command as string).trim();
-    if (gitBlocked && containsBlockedGitCommand(command)) {
+    const command = event.input.command;
+    if (typeof command !== "string") return undefined;
+    const trimmed = command.trim();
+    if (gitBlocked && containsBlockedGitCommand(trimmed)) {
       return { block: true, reason: "Mutative git commands are blocked. Use /toggle-allow-git to allow for this session." };
     }
     return undefined;
