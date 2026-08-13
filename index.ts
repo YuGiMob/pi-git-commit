@@ -207,6 +207,20 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   });
 
+  const activateGitCommit = () => {
+    const activeTools = pi.getActiveTools();
+    if (!activeTools.includes("git_commit")) {
+      pi.setActiveTools([...activeTools, "git_commit"]);
+    }
+  };
+
+  const deactivateGitCommit = () => {
+    const activeTools = pi.getActiveTools();
+    if (activeTools.includes("git_commit")) {
+      pi.setActiveTools(activeTools.filter((tool) => tool !== "git_commit"));
+    }
+  };
+
   pi.registerTool({
     name: "git_commit",
     label: "Git Commit",
@@ -224,33 +238,33 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      try {
+        const { type, message } = params;
+        const trimmedMessage = message.trim();
+        if (!trimmedMessage) {
+          return { content: [{ type: "text", text: "Commit message must not be empty." }], details: {}, isError: true };
+        }
+        const fullMessage = `${type}: ${trimmedMessage}`;
+        const addResult = await pi.exec("git", ["add", "."], { signal });
+        if (addResult.code !== 0) {
+          return { content: [{ type: "text", text: `Staging failed: ${addResult.stderr}` }], details: {}, isError: true };
+        }
 
-      const { type, message } = params;
-      const trimmedMessage = message.trim();
-      if (!trimmedMessage) {
-        return { content: [{ type: "text", text: "Commit message must not be empty." }], details: {}, isError: true };
-      }
-      const fullMessage = `${type}: ${trimmedMessage}`;
-      const addResult = await pi.exec("git", ["add", "."], { signal });
-      if (addResult.code !== 0) {
-        return { content: [{ type: "text", text: `Staging failed: ${addResult.stderr}` }], details: {}, isError: true };
-      }
+        const result = await pi.exec("git", ["commit", "-m", fullMessage], { signal });
+        if (result.code !== 0) {
+          return { content: [{ type: "text", text: `Commit failed: ${result.stderr}` }], details: {}, isError: true };
+        }
 
-      const result = await pi.exec("git", ["commit", "-m", fullMessage], { signal });
-      if (result.code !== 0) {
-        return { content: [{ type: "text", text: `Commit failed: ${result.stderr}` }], details: {}, isError: true };
+        return { content: [{ type: "text", text: `✓ Committed: ${fullMessage}` }], details: {} };
+      } finally {
+        deactivateGitCommit();
       }
-
-      return { content: [{ type: "text", text: `✓ Committed: ${fullMessage}` }], details: {} };
     },
   });
 
   pi.on("session_start", () => {
     gitBlocked = true;
-    const activeTools = pi.getActiveTools();
-    if (!activeTools.includes("git_commit")) {
-      pi.setActiveTools([...activeTools, "git_commit"]);
-    }
+    deactivateGitCommit();
   });
 
   pi.registerCommand("commit", {
@@ -287,6 +301,7 @@ export default function (pi: ExtensionAPI) {
         const diff = diffResult.stdout || "(no changes staged)";
 
         const prompt = `DO NOT use bash for git. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\`\`\`diff\n${diff}\`\`\`\n\nUse \`git_commit\` tool with:\n- type: FIX (bug fix), IMPROVE (improvement), or NEW (new feature)\n- message: brief description (imperative mood). Multi-line allowed for detailed changes.`;
+        activateGitCommit();
         pi.sendUserMessage(prompt, { deliverAs: "followUp" });
       } finally {
         ctx.ui.setWorkingMessage();

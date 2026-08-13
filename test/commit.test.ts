@@ -580,10 +580,16 @@ EOF`;
   });
 
   describe("session_start handler", () => {
-    it("ensures git_commit tool is active", () => {
-      pi.getActiveTools = vi.fn(() => []);
+    it("ensures git_commit tool is inactive", () => {
+      pi.getActiveTools = vi.fn(() => ["git_commit"]);
       sessionStartHandler!();
-      expect(pi.setActiveTools).toHaveBeenCalled();
+      expect(pi.setActiveTools).toHaveBeenCalledWith([]);
+    });
+
+    it("leaves active tools untouched when git_commit is already inactive", () => {
+      pi.getActiveTools = vi.fn(() => ["read", "bash"]);
+      sessionStartHandler!();
+      expect(pi.setActiveTools).not.toHaveBeenCalled();
     });
   });
 
@@ -619,6 +625,16 @@ EOF`;
         { deliverAs: "followUp" },
       );
       expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
+    });
+
+    it("activates git_commit before sending the follow-up", async () => {
+      pi.getActiveTools = vi.fn(() => []);
+      pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+      const ctx = createCtx();
+
+      await commitCommand()!.cmd.handler("", ctx);
+
+      expect(pi.setActiveTools).toHaveBeenCalledWith(["git_commit"]);
     });
 
     it("restores the default working message when git add fails", async () => {
@@ -657,6 +673,7 @@ EOF`;
   describe("git_commit tool integration (real git)", () => {
     let tempDir: string;
     let tool: any;
+    let fakePi: any;
 
     const runGit = (args: string[]) => {
       const result = spawnSync("git", args, { cwd: tempDir, encoding: "utf-8" });
@@ -672,7 +689,7 @@ EOF`;
 
       vi.resetModules();
       const mod = await import("../index.js");
-      const fakePi: any = {
+      fakePi = {
         on: vi.fn(),
         registerTool: vi.fn((registered: any) => {
           tool = registered;
@@ -715,6 +732,31 @@ EOF`;
       const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("empty");
+    });
+
+    it("deactivates git_commit after a successful commit", async () => {
+      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+      fs.writeFileSync(path.join(tempDir, "c.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "add c.txt" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+    });
+
+    it("deactivates git_commit after a failed commit", async () => {
+      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+      fs.writeFileSync(path.join(tempDir, "d.txt"), "hello");
+      runGit(["add", "."]);
+      runGit(["commit", "-m", "seed"]);
+      const result = await tool.execute("call-1", { type: "IMPROVE", message: "no changes" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+    });
+
+    it("deactivates git_commit after an empty-message rejection", async () => {
+      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+      const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
     });
   });
 });

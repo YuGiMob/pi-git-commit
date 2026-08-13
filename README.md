@@ -5,8 +5,8 @@ Keeps mutative git operations out of the agent's bash and provides a safe, revie
 ## What you get
 
 - **Bash git guard.** Mutative git commands are blocked in the agent's bash tool — `add`, `stage`, `commit`, `push`, `pull`, `merge`, `rebase`, `reset`, `clean`, `rm`, `restore`, `switch`, `cherry-pick`, `revert`, `mv`, `init`, `clone`, index/object plumbing (`read-tree`, `checkout-index`, `merge-file`, `prune-packed`), plus mutative forms of `branch` (including creation, `-u`, `-f`, `-c`/`-C`/`--copy`, `-D`/`-M`, `--force`, `-t`/`--track`), `tag` (including creation), `checkout` (including whole-tree restores like `checkout -- .`), `stash`, `submodule`, `worktree`, `config`, `remote`, `apply`, `notes`, `update-ref`, `gc` and more. Read-only commands (`status`, `diff`, `log`, `fetch`, `branch`, `tag`, `stash list`, ...) stay allowed.
-- **`git_commit` tool.** The agent stages everything and commits with a `FIX` / `IMPROVE` / `NEW` type prefix. Enabled automatically on session start.
-- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows the staged diff, and asks the agent to review it and commit via `git_commit` — never via bash.
+- **`git_commit` tool.** The agent stages everything and commits with a `FIX` / `IMPROVE` / `NEW` type prefix. Inactive by default: `/commit` activates it for the commit flow and it is disabled again after use, so the agent cannot commit on its own at other times.
+- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows the staged diff, activates the `git_commit` tool, and asks the agent to review it and commit via `git_commit` — never via bash.
 - **`/toggle-allow-git` command.** Temporarily allows mutative git commands in bash for the current session. The guard re-arms on the next session.
 
 ## Quick start
@@ -53,7 +53,7 @@ pi install /path/to/pi-git-commit
 | `type` | `FIX` (bug fix), `IMPROVE` (improvement), or `NEW` (new feature). |
 | `message` | Commit message in imperative mood. Multi-line allowed for detailed changes. |
 
-The tool runs `git add .` followed by `git commit -m "<TYPE>: <message>"` and reports staging or commit failures as tool errors. The agent is instructed to only use it after you run `/commit`.
+The tool runs `git add .` followed by `git commit -m "<TYPE>: <message>"` and reports staging or commit failures as tool errors. The tool is inactive by default and only becomes available when you run `/commit`; it is deactivated again after a single use (success or failure), so the agent cannot commit at arbitrary points in the conversation. If a commit fails, run `/commit` again to retry.
 
 ## The bash guard
 
