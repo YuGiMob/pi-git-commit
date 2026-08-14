@@ -698,6 +698,7 @@ EOF`;
         getActiveTools: vi.fn(() => []),
         setActiveTools: vi.fn(),
         sendUserMessage: vi.fn(),
+        sendMessage: vi.fn(),
         exec: (command: string, args: string[], opts?: { cwd?: string }) => {
           const result = spawnSync(command, args, { cwd: opts?.cwd ?? tempDir, encoding: "utf-8" });
           return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
@@ -740,6 +741,17 @@ EOF`;
       const result = await tool.execute("call-1", { type: "FIX", message: "add c.txt" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+    });
+
+    it("tells the model the tool is deactivated after a successful commit", async () => {
+      fs.writeFileSync(path.join(tempDir, "e.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "add e.txt" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).not.toContain("deactivated");
+      expect(fakePi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ display: false, content: expect.stringContaining("deactivated") }),
+        expect.objectContaining({ deliverAs: "steer" }),
+      );
     });
 
     it("deactivates git_commit after a failed commit", async () => {

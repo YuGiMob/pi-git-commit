@@ -255,6 +255,10 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Commit failed: ${result.stderr}` }], details: {}, isError: true };
         }
 
+        pi.sendMessage(
+          { customType: "git-commit-deactivated", content: "The git_commit tool is now deactivated. It cannot be used again until the user runs /commit to re-enable it.", display: false },
+          { deliverAs: "steer" },
+        );
         return { content: [{ type: "text", text: `✓ Committed: ${fullMessage}` }], details: {} };
       } finally {
         deactivateGitCommit();
