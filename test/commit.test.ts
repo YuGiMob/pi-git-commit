@@ -749,7 +749,7 @@ EOF`;
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).not.toContain("deactivated");
       expect(fakePi.sendMessage).toHaveBeenCalledWith(
-        expect.objectContaining({ display: false, content: expect.stringContaining("deactivated") }),
+        expect.objectContaining({ display: false, content: expect.stringMatching(/deactivated.*Do not mention/) }),
         expect.objectContaining({ deliverAs: "steer" }),
       );
     });
@@ -769,6 +769,58 @@ EOF`;
       const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
       expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+    });
+
+    it("strips a leading type prefix from the message to avoid duplication", async () => {
+      fs.writeFileSync(path.join(tempDir, "f.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "Fix: correct the off-by-one" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: correct the off-by-one");
+    });
+
+    it("strips repeated and differently-cased type prefixes", async () => {
+      fs.writeFileSync(path.join(tempDir, "g.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "fix: FIX: Fix: correct it" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: correct it");
+    });
+
+    it("strips the type prefix for every commit type", async () => {
+      fs.writeFileSync(path.join(tempDir, "h1.txt"), "hello");
+      let result = await tool.execute("call-1", { type: "IMPROVE", message: "Improve: parser speed" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("IMPROVE: parser speed");
+      fs.writeFileSync(path.join(tempDir, "h2.txt"), "hello");
+      result = await tool.execute("call-1", { type: "NEW", message: "New: add retry loop" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("NEW: add retry loop");
+    });
+
+    it("strips the type word even without a separator", async () => {
+      fs.writeFileSync(path.join(tempDir, "i.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "Fix the fixtures loader" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: the fixtures loader");
+    });
+
+    it("strips the type word with dash separators", async () => {
+      fs.writeFileSync(path.join(tempDir, "j.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "FIX — harden the retry loop" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: harden the retry loop");
+    });
+
+    it("does not tear the type word out of longer words", async () => {
+      fs.writeFileSync(path.join(tempDir, "k.txt"), "hello");
+      const result = await tool.execute("call-1", { type: "FIX", message: "fixes the load order" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: fixes the load order");
+    });
+
+    it("rejects a message that is only a type prefix", async () => {
+      const result = await tool.execute("call-1", { type: "FIX", message: "Fix:" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("empty");
     });
   });
 });

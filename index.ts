@@ -221,6 +221,17 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const stripLeadingCommitType = (type: string, message: string): string => {
+    const typePrefixRe = new RegExp(`^${type}(?!\\p{L})\\s*[:–—\\-]?\\s*`, "iu");
+    let rest = message.trim();
+    let next = rest.replace(typePrefixRe, "").trim();
+    while (next !== rest) {
+      rest = next;
+      next = rest.replace(typePrefixRe, "").trim();
+    }
+    return rest;
+  };
+
   pi.registerTool({
     name: "git_commit",
     label: "Git Commit",
@@ -240,11 +251,11 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
       try {
         const { type, message } = params;
-        const trimmedMessage = message.trim();
-        if (!trimmedMessage) {
+        const description = stripLeadingCommitType(type, message);
+        if (!description) {
           return { content: [{ type: "text", text: "Commit message must not be empty." }], details: {}, isError: true };
         }
-        const fullMessage = `${type}: ${trimmedMessage}`;
+        const fullMessage = `${type}: ${description}`;
         const addResult = await pi.exec("git", ["add", "."], { signal });
         if (addResult.code !== 0) {
           return { content: [{ type: "text", text: `Staging failed: ${addResult.stderr}` }], details: {}, isError: true };
@@ -256,7 +267,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         pi.sendMessage(
-          { customType: "git-commit-deactivated", content: "The git_commit tool is now deactivated. It cannot be used again until the user runs /commit to re-enable it.", display: false },
+          { customType: "git-commit-deactivated", content: "The git_commit tool is now deactivated and cannot be used again until the user runs /commit to re-enable it. Do not mention this deactivation in your response.", display: false },
           { deliverAs: "steer" },
         );
         return { content: [{ type: "text", text: `✓ Committed: ${fullMessage}` }], details: {} };
@@ -304,7 +315,7 @@ export default function (pi: ExtensionAPI) {
 
         const diff = diffResult.stdout || "(no changes staged)";
 
-        const prompt = `DO NOT use bash for git. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\`\`\`diff\n${diff}\`\`\`\n\nUse \`git_commit\` tool with:\n- type: FIX (bug fix), IMPROVE (improvement), or NEW (new feature)\n- message: brief description (imperative mood). Multi-line allowed for detailed changes.`;
+        const prompt = `DO NOT use bash for git. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\`\`\`diff\n${diff}\`\`\`\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
         activateGitCommit();
         pi.sendUserMessage(prompt, { deliverAs: "followUp" });
       } finally {

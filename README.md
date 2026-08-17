@@ -24,7 +24,7 @@ Keeps mutative git operations out of the agent's bash and provides a safe, revie
 ```json
 {
   "type": "FIX",
-  "message": "Fix off-by-one in the retry loop"
+  "message": "Correct the off-by-one in the retry loop"
 }
 ```
 
@@ -51,9 +51,9 @@ pi install /path/to/pi-git-commit
 | Field | Description |
 | --- | --- |
 | `type` | `FIX` (bug fix), `IMPROVE` (improvement), or `NEW` (new feature). |
-| `message` | Commit message in imperative mood. Multi-line allowed for detailed changes. |
+| `message` | Commit message in imperative mood, without the type prefix (it is added automatically). A leading type word matching the chosen type is stripped (with `:`, whitespace, or `-`/`—` separators, any casing, repeats included) so the type is never duplicated. Multi-line allowed for detailed changes. |
 
-The tool runs `git add .` followed by `git commit -m "<TYPE>: <message>"` and reports staging or commit failures as tool errors. The tool is inactive by default and only becomes available when you run `/commit`; it is deactivated again after a single use (success or failure), so the agent cannot commit at arbitrary points in the conversation. If a commit fails, run `/commit` again to retry.
+The tool runs `git add .` followed by `git commit -m "<TYPE>: <message>"` and reports staging or commit failures as tool errors. A leading type word in the message is stripped whenever it repeats the chosen type — with `:`, whitespace, or `-`/`—` separators, at any casing, repeated prefixes included — so the type never ends up duplicated: `FIX: Fix: ...`, `FIX: Fix ...`, and `fix - ...` all become `FIX: ...`. The tool is inactive by default and only becomes available when you run `/commit`; it is deactivated again after a single use (success or failure), so the agent cannot commit at arbitrary points in the conversation. If a commit fails, run `/commit` again to retry.
 
 ## The bash guard
 
