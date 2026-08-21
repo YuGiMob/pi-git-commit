@@ -579,6 +579,13 @@ EOF`;
     });
   });
 
+  describe("/stop-commit command registration", () => {
+    it("registers a command named stop-commit", () => {
+      const cmd = capturedCommands.find((c: any) => c.name === "stop-commit");
+      expect(cmd).toBeDefined();
+    });
+  });
+
   describe("session_start handler", () => {
     it("ensures git_commit tool is inactive", () => {
       pi.getActiveTools = vi.fn(() => ["git_commit"]);
@@ -667,6 +674,98 @@ EOF`;
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Nothing to commit"), "warning");
       expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
+    });
+  });
+
+  describe("/stop-commit command handler", () => {
+    let stopCommand: any;
+    let commitCommand: any;
+    let fakePi: any;
+
+    function createCtx() {
+      return {
+        hasUI: true,
+        ui: {
+          notify: vi.fn(),
+          setWorkingMessage: vi.fn(),
+        },
+        waitForIdle: vi.fn(),
+      };
+    }
+
+    beforeEach(async () => {
+      vi.resetModules();
+      const mod = await import("../index.js");
+      fakePi = {
+        on: vi.fn(),
+        registerTool: vi.fn(),
+        registerCommand: vi.fn((name: string, cmd: any) => {
+          if (name === "stop-commit") stopCommand = cmd;
+          if (name === "commit") commitCommand = cmd;
+        }),
+        getActiveTools: vi.fn(() => []),
+        setActiveTools: vi.fn(),
+        sendUserMessage: vi.fn(),
+        sendMessage: vi.fn(),
+        exec: vi.fn(),
+      };
+      mod.default(fakePi);
+    });
+
+    it("deactivates git_commit and notifies when a flow is active", async () => {
+      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+      const ctx = createCtx();
+      await stopCommand.handler("", ctx);
+      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stopped"), "info");
+    });
+
+    it("steers the agent away from committing when the flow reached it", async () => {
+      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+      const ctx = createCtx();
+      await stopCommand.handler("", ctx);
+      expect(fakePi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ display: false, content: expect.stringMatching(/stopped/) }),
+        expect.objectContaining({ deliverAs: "steer" }),
+      );
+    });
+
+    it("notifies that no flow is in progress when none is active", async () => {
+      const ctx = createCtx();
+      await stopCommand.handler("", ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("No commit flow"), "info");
+      expect(fakePi.setActiveTools).not.toHaveBeenCalled();
+    });
+
+    it("aborts a pending /commit flow while it waits for idle", async () => {
+      let resolveIdle!: () => void;
+      const idlePromise = new Promise<void>((resolve) => { resolveIdle = resolve; });
+      const ctx = createCtx();
+      ctx.waitForIdle = vi.fn(() => idlePromise);
+      fakePi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+      const commitPromise = commitCommand.handler("", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await stopCommand.handler("", createCtx());
+      resolveIdle();
+      await commitPromise;
+      expect(fakePi.sendUserMessage).not.toHaveBeenCalled();
+      expect(fakePi.setActiveTools).not.toHaveBeenCalled();
+    });
+
+    it("aborts a pending /commit flow while it is staging", async () => {
+      let resolveAdd!: (value: any) => void;
+      const addPromise = new Promise((resolve) => { resolveAdd = resolve; });
+      fakePi.exec = vi.fn()
+        .mockReturnValueOnce(addPromise)
+        .mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+      const ctx = createCtx();
+      const commitPromise = commitCommand.handler("", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await stopCommand.handler("", createCtx());
+      resolveAdd({ code: 0, stdout: "", stderr: "" });
+      await commitPromise;
+      expect(fakePi.sendUserMessage).not.toHaveBeenCalled();
+      expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
   });
 

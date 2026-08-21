@@ -1,12 +1,13 @@
 # pi-git-commit
 
-Keeps mutative git operations out of the agent's bash and provides a safe, reviewable commit flow in [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent): a bash guard, a `git_commit` tool, and `/commit` + `/toggle-allow-git` commands.
+Keeps mutative git operations out of the agent's bash and provides a safe, reviewable commit flow in [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent): a bash guard, a `git_commit` tool, and `/commit`, `/stop-commit` and `/toggle-allow-git` commands.
 
 ## What you get
 
 - **Bash git guard.** Mutative git commands are blocked in the agent's bash tool — `add`, `stage`, `commit`, `push`, `pull`, `merge`, `rebase`, `reset`, `clean`, `rm`, `restore`, `switch`, `cherry-pick`, `revert`, `mv`, `init`, `clone`, index/object plumbing (`read-tree`, `checkout-index`, `merge-file`, `prune-packed`), plus mutative forms of `branch` (including creation, `-u`, `-f`, `-c`/`-C`/`--copy`, `-D`/`-M`, `--force`, `-t`/`--track`), `tag` (including creation), `checkout` (including whole-tree restores like `checkout -- .`), `stash`, `submodule`, `worktree`, `config`, `remote`, `apply`, `notes`, `update-ref`, `gc` and more. Read-only commands (`status`, `diff`, `log`, `fetch`, `branch`, `tag`, `stash list`, ...) stay allowed.
 - **`git_commit` tool.** The agent stages everything and commits with a `FIX` / `IMPROVE` / `NEW` type prefix. Inactive by default: `/commit` activates it for the commit flow and it is disabled again after use, so the agent cannot commit on its own at other times.
-- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows the staged diff, activates the `git_commit` tool, and asks the agent to review it and commit via `git_commit` — never via bash.
+- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows the staged diff, activates the `git_commit` tool, and asks the agent to review it and commit via `git_commit` — never via bash. Run `/stop-commit` at any point to abort the flow.
+- **`/stop-commit` command.** Aborts a pending commit flow: deactivates the `git_commit` tool and cancels a `/commit` that is still waiting for queued messages, so no commit is made.
 - **`/toggle-allow-git` command.** Temporarily allows mutative git commands in bash for the current session. The guard re-arms on the next session.
 
 ## Quick start
@@ -28,7 +29,9 @@ Keeps mutative git operations out of the agent's bash and provides a safe, revie
 }
 ```
 
-4. If you need to run mutative git yourself, allow it for the session:
+4. Changed your mind? Run `/stop-commit` to abort the flow before the agent commits.
+
+5. If you need to run mutative git yourself, allow it for the session:
 
 ```text
 /toggle-allow-git
@@ -70,6 +73,7 @@ Mutative git commands are blocked. Use /toggle-allow-git to allow for this sessi
 ## Troubleshooting
 
 - **The agent refuses to commit.** The guard blocks `git commit` in bash by design. Run `/commit` and let the agent use the `git_commit` tool.
+- **The agent stopped committing.** You ran `/stop-commit`, which aborted the pending flow. Run `/commit` again to start a new one.
 - **"Nothing to commit (empty diff)."** There are no staged changes — make edits first, then run `/commit` again.
 - **I need git in bash right now.** Run `/toggle-allow-git`; the guard re-arms automatically on the next session start.
 

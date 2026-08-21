@@ -5,6 +5,7 @@ const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
 
 export default function (pi: ExtensionAPI) {
   let gitBlocked = true;
+  let commitFlowActive = false;
 
   const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec"]);
   const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
@@ -272,6 +273,7 @@ export default function (pi: ExtensionAPI) {
         );
         return { content: [{ type: "text", text: `✓ Committed: ${fullMessage}` }], details: {} };
       } finally {
+        commitFlowActive = false;
         deactivateGitCommit();
       }
     },
@@ -279,6 +281,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", () => {
     gitBlocked = true;
+    commitFlowActive = false;
     deactivateGitCommit();
   });
 
@@ -289,15 +292,18 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("commit requires interactive mode", "error");
         return;
       }
+      commitFlowActive = true;
 
       try {
         await ctx.ui.setWorkingMessage("Waiting for queued messages to complete...");
         await ctx.waitForIdle();
+        if (!commitFlowActive) return;
 
         await ctx.ui.setWorkingMessage("Staging files...");
         const addResult = await pi.exec("git", ["add", "."]);
         if (addResult.code !== 0) {
           ctx.ui.notify(`git add failed: ${addResult.stderr}`, "error");
+          commitFlowActive = false;
           return;
         }
 
@@ -305,17 +311,20 @@ export default function (pi: ExtensionAPI) {
         const diffResult = await pi.exec("git", ["diff", "--staged"]);
         if (diffResult.code !== 0) {
           ctx.ui.notify(`git diff failed: ${diffResult.stderr}`, "error");
+          commitFlowActive = false;
           return;
         }
 
         if (!diffResult.stdout.trim()) {
           ctx.ui.notify("Nothing to commit (empty diff). Stage files first.", "warning");
+          commitFlowActive = false;
           return;
         }
 
         const diff = diffResult.stdout || "(no changes staged)";
 
         const prompt = `DO NOT use bash for git. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\`\`\`diff\n${diff}\`\`\`\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
+        if (!commitFlowActive) return;
         activateGitCommit();
         pi.sendUserMessage(prompt, { deliverAs: "followUp" });
       } finally {
@@ -323,6 +332,32 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+
+  pi.registerCommand("stop-commit", {
+    description: "Stop the pending commit flow started by /commit",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("stop-commit requires interactive mode", "error");
+        return;
+      }
+      const toolWasActive = pi.getActiveTools().includes("git_commit");
+      const flowWasActive = commitFlowActive;
+      commitFlowActive = false;
+      deactivateGitCommit();
+      if (toolWasActive) {
+        pi.sendMessage(
+          { customType: "git-commit-stopped", content: "The user stopped the commit flow with /stop-commit. Do not attempt to commit. Do not mention this in your response.", display: false },
+          { deliverAs: "steer" },
+        );
+        ctx.ui.notify("Commit flow stopped. The git_commit tool is deactivated.", "info");
+      } else if (flowWasActive) {
+        ctx.ui.notify("Commit flow stopped.", "info");
+      } else {
+        ctx.ui.notify("No commit flow in progress.", "info");
+      }
+    },
+  });
+
   pi.registerCommand("toggle-allow-git", {
     description: "Toggle whether mutative git commands are allowed in bash for this session",
     handler: async (_args, ctx) => {
