@@ -892,32 +892,32 @@ EOF`;
       expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
     });
 
-    it("tells the model the tool is deactivated after a successful commit", async () => {
+    it("steers the model with a minimal completion message after a successful commit", async () => {
       fs.writeFileSync(path.join(tempDir, "e.txt"), "hello");
       const result = await tool.execute("call-1", { type: "FIX", message: "add e.txt" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).not.toContain("deactivated");
       expect(fakePi.sendMessage).toHaveBeenCalledWith(
-        expect.objectContaining({ display: false, content: expect.stringMatching(/deactivated.*Do not mention/) }),
+        expect.objectContaining({ display: false, content: expect.stringMatching(/flow is complete/) }),
         expect.objectContaining({ deliverAs: "steer" }),
       );
     });
 
-    it("deactivates git_commit after a failed commit", async () => {
+    it("keeps git_commit active after a failed commit", async () => {
       fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
       fs.writeFileSync(path.join(tempDir, "d.txt"), "hello");
       runGit(["add", "."]);
       runGit(["commit", "-m", "seed"]);
       const result = await tool.execute("call-1", { type: "IMPROVE", message: "no changes" }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
-      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+      expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
 
-    it("deactivates git_commit after an empty-message rejection", async () => {
+    it("keeps git_commit active after an empty-message rejection", async () => {
       fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
       const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
-      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+      expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
 
     it("strips a leading type prefix from the message to avoid duplication", async () => {

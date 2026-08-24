@@ -252,6 +252,7 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      let committed = false;
       try {
         const { type, message } = params;
         const description = stripLeadingCommitType(type, message);
@@ -268,15 +269,17 @@ export default function (pi: ExtensionAPI) {
         if (result.code !== 0) {
           return { content: [{ type: "text", text: `Commit failed: ${result.stderr}` }], details: {}, isError: true };
         }
-
+        committed = true;
         pi.sendMessage(
-          { customType: "git-commit-deactivated", content: "The git_commit tool is now deactivated and cannot be used again until the user runs /commit to re-enable it. Do not mention this deactivation in your response.", display: false },
+          { customType: "git-commit-flow-complete", content: "The commit flow is complete.", display: false },
           { deliverAs: "steer" },
         );
         return { content: [{ type: "text", text: `✓ Committed: ${fullMessage}` }], details: {} };
       } finally {
-        commitFlowActive = false;
-        deactivateGitCommit();
+        if (committed) {
+          commitFlowActive = false;
+          deactivateGitCommit();
+        }
       }
     },
   });
@@ -372,7 +375,7 @@ export default function (pi: ExtensionAPI) {
       deactivateGitCommit();
       if (toolWasActive) {
         pi.sendMessage(
-          { customType: "git-commit-stopped", content: "The user stopped the commit flow with /stop-commit. Do not attempt to commit. Do not mention this in your response.", display: false },
+          { customType: "git-commit-stopped", content: "The user stopped the commit flow with /stop-commit. Do not attempt to commit.", display: false },
           { deliverAs: "steer" },
         );
         ctx.ui.notify("Commit flow stopped. The git_commit tool is deactivated.", "info");
