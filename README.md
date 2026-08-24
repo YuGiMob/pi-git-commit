@@ -6,7 +6,7 @@ Keeps mutative git operations out of the agent's bash and provides a safe, revie
 
 - **Bash git guard.** Mutative git commands are blocked in the agent's bash tool — `add`, `stage`, `commit`, `push`, `pull`, `merge`, `rebase`, `reset`, `clean`, `rm`, `restore`, `switch`, `cherry-pick`, `revert`, `mv`, `init`, `clone`, index/object plumbing (`read-tree`, `checkout-index`, `merge-file`, `prune-packed`), plus mutative forms of `branch` (including creation, `-u`, `-f`, `-c`/`-C`/`--copy`, `-D`/`-M`, `--force`, `-t`/`--track`), `tag` (including creation), `checkout` (including whole-tree restores like `checkout -- .`), `stash`, `submodule`, `worktree`, `config`, `remote`, `apply`, `notes`, `update-ref`, `gc` and more. Read-only commands (`status`, `diff`, `log`, `fetch`, `branch`, `tag`, `stash list`, ...) stay allowed.
 - **`git_commit` tool.** The agent stages everything and commits with a `FIX` / `IMPROVE` / `NEW` type prefix. Inactive by default: `/commit` activates it for the commit flow and it is disabled again after use, so the agent cannot commit on its own at other times.
-- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows the staged diff, activates the `git_commit` tool, and asks the agent to review it and commit via `git_commit` — never via bash. Run `/stop-commit` at any point to abort the flow.
+- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows a collapsed summary of the staged diff (a `git diff --stat` line; press `ctrl+o` to expand the full diff), activates the `git_commit` tool, and asks the agent to review the changes and commit via `git_commit` — never via bash. Run `/stop-commit` at any point to abort the flow.
 - **`/stop-commit` command.** Aborts a pending commit flow: deactivates the `git_commit` tool and cancels a `/commit` that is still waiting for queued messages, so no commit is made.
 - **`/toggle-allow-git` command.** Temporarily allows mutative git commands in bash for the current session. The guard re-arms on the next session.
 
@@ -18,7 +18,7 @@ Keeps mutative git operations out of the agent's bash and provides a safe, revie
 /commit
 ```
 
-2. The extension stages the working tree and hands the staged diff to the agent with instructions to review it.
+2. The extension stages the working tree and shows a collapsed summary of the staged diff — press `ctrl+o` to expand it. The full diff is handed to the agent with instructions to review it.
 
 3. The agent commits using the `git_commit` tool:
 

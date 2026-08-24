@@ -1,7 +1,9 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { keyHint, renderDiff, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
+const DIFF_CUSTOM_TYPE = "git-commit-diff";
 
 export default function (pi: ExtensionAPI) {
   let gitBlocked = true;
@@ -285,6 +287,23 @@ export default function (pi: ExtensionAPI) {
     deactivateGitCommit();
   });
 
+  pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
+    const details = message.details as { diff?: string; stat?: string } | undefined;
+    const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(new Text(theme.fg("accent", "Staged changes"), 0, 0));
+    if (expanded) {
+      if (details?.diff) {
+        box.addChild(new Text(renderDiff(details.diff), 0, 0));
+      }
+    } else {
+      if (details?.stat) {
+        box.addChild(new Text(details.stat, 0, 0));
+      }
+      box.addChild(new Text(theme.fg("dim", `(${keyHint("app.tools.expand", "to expand")})`), 0, 0));
+    }
+    return box;
+  });
+
   pi.registerCommand("commit", {
     description: "Stage files and show diff for commit",
     handler: async (_args, ctx) => {
@@ -323,10 +342,17 @@ export default function (pi: ExtensionAPI) {
 
         const diff = diffResult.stdout || "(no changes staged)";
 
+        const statResult = await pi.exec("git", ["diff", "--staged", "--stat"]);
+        if (!commitFlowActive) return;
+        const stat = statResult.code === 0 ? statResult.stdout.trim().split("\n").pop() ?? "" : "";
+
         const prompt = `DO NOT use bash for git. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\`\`\`diff\n${diff}\`\`\`\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
         if (!commitFlowActive) return;
         activateGitCommit();
-        pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+        pi.sendMessage(
+          { customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details: { diff, stat } },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
       } finally {
         ctx.ui.setWorkingMessage();
       }

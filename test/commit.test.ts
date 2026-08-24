@@ -13,6 +13,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     Literal: (val: string) => ({ type: "literal", value: val }),
     Optional: (schema: any) => ({ ...schema, optional: true }),
   },
+  keyHint: (id: string, description: string) => `${id} (${description})`,
+  renderDiff: (text: string) => text,
 }));
 
 vi.mock("typebox", () => ({
@@ -30,6 +32,7 @@ describe("commit extension", () => {
   let extension: any;
   let pi: any;
   let capturedTool: any;
+  let capturedMessageRenderer: any;
   let capturedCommands: any[];
   let toolCallHandler: ((event: any) => Promise<any>) | undefined;
   let sessionStartHandler: (() => void) | undefined;
@@ -42,6 +45,7 @@ describe("commit extension", () => {
 
   beforeEach(async () => {
     capturedCommands = [];
+    capturedMessageRenderer = undefined;
     toolCallHandler = undefined;
     sessionStartHandler = undefined;
     pi = {
@@ -52,12 +56,16 @@ describe("commit extension", () => {
       registerTool: vi.fn((tool: any) => {
         capturedTool = tool;
       }),
+      registerMessageRenderer: vi.fn((customType: string, renderer: any) => {
+        if (customType === "git-commit-diff") capturedMessageRenderer = renderer;
+      }),
       registerCommand: vi.fn((name: string, cmd: any) => {
         capturedCommands.push({ name, cmd });
       }),
       getActiveTools: vi.fn(() => ["git_commit"]),
       setActiveTools: vi.fn(),
       sendUserMessage: vi.fn(),
+      sendMessage: vi.fn(),
       exec: vi.fn(),
     };
 
@@ -621,20 +629,29 @@ EOF`;
       };
     }
 
-    it("sends the follow-up with the staged diff and restores the default working message", async () => {
-      pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+    it("sends the staged diff as a collapsible custom message and restores the default working message", async () => {
+      pi.exec = vi.fn()
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "diff --git a/x b/x\n+hello", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "1 file changed, 1 insertion(+)", stderr: "" });
       const ctx = createCtx();
 
       await commitCommand()!.cmd.handler("", ctx);
 
-      expect(pi.sendUserMessage).toHaveBeenCalledWith(
-        expect.stringContaining("diff --git a/x b/x"),
-        { deliverAs: "followUp" },
+      expect(pi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          customType: "git-commit-diff",
+          display: true,
+          content: expect.stringContaining("diff --git a/x b/x"),
+          details: { diff: "diff --git a/x b/x\n+hello", stat: "1 file changed, 1 insertion(+)" },
+        }),
+        expect.objectContaining({ deliverAs: "followUp", triggerTurn: true }),
       );
+      expect(pi.sendUserMessage).not.toHaveBeenCalled();
       expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
     });
 
-    it("activates git_commit before sending the follow-up", async () => {
+    it("activates git_commit before sending the custom message", async () => {
       pi.getActiveTools = vi.fn(() => []);
       pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
       const ctx = createCtx();
@@ -642,6 +659,7 @@ EOF`;
       await commitCommand()!.cmd.handler("", ctx);
 
       expect(pi.setActiveTools).toHaveBeenCalledWith(["git_commit"]);
+      expect(pi.sendMessage).toHaveBeenCalled();
     });
 
     it("restores the default working message when git add fails", async () => {
@@ -677,6 +695,36 @@ EOF`;
     });
   });
 
+  describe("git-commit-diff message renderer", () => {
+    const theme = {
+      bg: (_name: string, text: string) => text,
+      fg: (_name: string, text: string) => text,
+    };
+    const message = {
+      content: "Review staged changes",
+      details: { diff: "diff --git a/x b/x\n+hello", stat: "1 file changed, 1 insertion(+)" },
+    };
+
+    it("registers a renderer for git-commit-diff", () => {
+      expect(capturedMessageRenderer).toBeDefined();
+    });
+
+    it("shows the stat summary and an expand hint when collapsed", () => {
+      const box = capturedMessageRenderer(message, { expanded: false, outputPad: 0 }, theme);
+      const text = box.render(80).join("\n");
+      expect(text).toContain("1 file changed, 1 insertion(+)");
+      expect(text).toContain("app.tools.expand");
+      expect(text).not.toContain("diff --git");
+    });
+
+    it("shows the full diff when expanded", () => {
+      const box = capturedMessageRenderer(message, { expanded: true, outputPad: 0 }, theme);
+      const text = box.render(80).join("\n");
+      expect(text).toContain("diff --git a/x b/x");
+      expect(text).toContain("+hello");
+    });
+  });
+
   describe("/stop-commit command handler", () => {
     let stopCommand: any;
     let commitCommand: any;
@@ -699,6 +747,7 @@ EOF`;
       fakePi = {
         on: vi.fn(),
         registerTool: vi.fn(),
+        registerMessageRenderer: vi.fn(),
         registerCommand: vi.fn((name: string, cmd: any) => {
           if (name === "stop-commit") stopCommand = cmd;
           if (name === "commit") commitCommand = cmd;
@@ -748,7 +797,7 @@ EOF`;
       await stopCommand.handler("", createCtx());
       resolveIdle();
       await commitPromise;
-      expect(fakePi.sendUserMessage).not.toHaveBeenCalled();
+      expect(fakePi.sendMessage).not.toHaveBeenCalled();
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
 
@@ -764,7 +813,7 @@ EOF`;
       await stopCommand.handler("", createCtx());
       resolveAdd({ code: 0, stdout: "", stderr: "" });
       await commitPromise;
-      expect(fakePi.sendUserMessage).not.toHaveBeenCalled();
+      expect(fakePi.sendMessage).not.toHaveBeenCalled();
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
   });
@@ -793,6 +842,7 @@ EOF`;
         registerTool: vi.fn((registered: any) => {
           tool = registered;
         }),
+        registerMessageRenderer: vi.fn(),
         registerCommand: vi.fn(),
         getActiveTools: vi.fn(() => []),
         setActiveTools: vi.fn(),
