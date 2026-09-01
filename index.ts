@@ -205,7 +205,7 @@ export default function (pi: ExtensionAPI) {
     if (typeof command !== "string") return undefined;
     const trimmed = command.trim();
     if (gitBlocked && containsBlockedGitCommand(trimmed)) {
-      return { block: true, reason: "Mutative git commands are blocked. Use /toggle-allow-git to allow for this session." };
+      return { block: true, reason: "Mutative git commands are blocked. Ask the user to run /toggle-allow-git to allow them for this session." };
     }
     return undefined;
   });

@@ -67,7 +67,7 @@ The guard parses the command into segments (pipelines, `&&`, `||`, `;`, `&`, com
 A blocked command returns:
 
 ```text
-Mutative git commands are blocked. Use /toggle-allow-git to allow for this session.
+Mutative git commands are blocked. Ask the user to run /toggle-allow-git to allow them for this session.
 ```
 
 ## Troubleshooting
