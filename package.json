@@ -1,6 +1,6 @@
 {
   "name": "pi-git-commit",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "type": "module",
   "description": "Pi extension: block mutative git commands in bash and provide a git_commit tool plus /commit, /stop-commit and /toggle-allow-git commands",
   "main": "index.ts",
