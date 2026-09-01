@@ -15,10 +15,12 @@ export default function (pi: ExtensionAPI) {
   const GIT_META_OPTS = new Set(["--help", "-h", "--version"]);
   const GIT_OPTS_BARE = new Set(["--bare", "-p", "--paginate", "--no-pager", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks", "--html-path", "--man-path", "--info-path"]);
   const GIT_OPTS_WITH_ARG = new Set(["-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix", "--shallow-file", "--template", "--upload-pack"]);
+  const GIT_TAG_VALUE_FLAGS = new Set(["--sort", "--format", "-v"]);
+  const GIT_TAG_LIST_FORCING = new Set(["--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]);
 
   const blockAll = () => true;
   const hasAny = (args: string[], values: string[]) => values.some((value) => args.includes(value));
-  const allowOnly = (values: string[]) => (args: string[]) => !hasAny(args, values);
+  const blockUnlessAny = (values: string[]) => (args: string[]) => !hasAny(args, values);
   const hasShortFlag = (args: string[], flags: string) => args.some((arg) => arg.startsWith("-") && !arg.startsWith("--") && arg.length > 1 && [...arg.slice(1)].some((flag) => flags.includes(flag)));
 
   const GIT_RULES: Record<string, (args: string[]) => boolean> = {
@@ -64,15 +66,15 @@ export default function (pi: ExtensionAPI) {
       if (hasAny(args, ["--add", "--unset", "--unset-all", "--replace-all", "--remove-section", "--rename-section", "--edit", "-e"])) return true;
       return !hasAny(args, ["--list", "-l", "--get", "--get-all", "--get-regexp", "--show-origin", "--show-scope"]);
     },
-    remote: (args) => !(args.length === 0 || args.includes("-v") || hasAny(args, ["show", "get-url"])),
-    apply: allowOnly(["--check", "--stat"]),
-    notes: allowOnly(["list", "show"]),
-    lfs: allowOnly(["ls-files", "status"]),
-    "sparse-checkout": allowOnly(["list"]),
-    stash: allowOnly(["list", "show"]),
-    submodule: allowOnly(["status", "init", "summary"]),
-    worktree: allowOnly(["list"]),
-    reflog: (args) => !(args.length === 0 || hasAny(args, ["show"])),
+    remote: (args) => args.length > 0 && blockUnlessAny(["-v", "show", "get-url"])(args),
+    apply: blockUnlessAny(["--check", "--stat"]),
+    notes: blockUnlessAny(["list", "show"]),
+    lfs: blockUnlessAny(["ls-files", "status"]),
+    "sparse-checkout": blockUnlessAny(["list"]),
+    stash: blockUnlessAny(["list", "show"]),
+    submodule: blockUnlessAny(["status", "init", "summary"]),
+    worktree: blockUnlessAny(["list"]),
+    reflog: (args) => args.length > 0 && blockUnlessAny(["show"])(args),
     branch: (args) => {
       if (args.includes("--")) return true;
       if (hasAny(args, ["--delete", "--move", "--copy", "--force", "--track", "--prune", "--unset-upstream", "--edit-description"]) || args.some((arg) => arg.startsWith("--set-upstream-to"))) return true;
@@ -82,9 +84,13 @@ export default function (pi: ExtensionAPI) {
     },
     tag: (args) => {
       if (args.length === 0) return false;
+      if (hasAny(args, ["--delete", "--annotate", "--force", "--sign", "--edit", "--cleanup"]) || hasShortFlag(args, "damfsueF")) return true;
       const first = args[0];
       if (first === "-l" || first === "--list" || first.startsWith("-n")) return false;
-      return !["--contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--column", "--no-column", "--color", "--ignore-case", "--verbose", "-v"].some((flag) => first.startsWith(flag));
+      const readOnlyFlags = ["--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--column", "--no-column", "--color", "--ignore-case", "--verbose", "-i", "-v"];
+      if (!readOnlyFlags.some((flag) => first.startsWith(flag))) return true;
+      if ([...GIT_TAG_LIST_FORCING].some((flag) => args.some((arg) => arg === flag || arg.startsWith(`${flag}=`)))) return false;
+      return args.some((arg, index) => index > 0 && !arg.startsWith("-") && !GIT_TAG_VALUE_FLAGS.has(args[index - 1]));
     },
     checkout: (args) => {
       if (args[0] !== "--") return true;
@@ -98,7 +104,7 @@ export default function (pi: ExtensionAPI) {
   const maskHeredocBodies = (command: string): string => {
     let masked = "";
     let cursor = 0;
-    const heredocRe = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/g;
+    const heredocRe = /<<-?\s*\\?['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/g;
     let match: RegExpExecArray | null;
     while ((match = heredocRe.exec(command)) !== null) {
       const current = match;
@@ -161,6 +167,7 @@ export default function (pi: ExtensionAPI) {
     let subcommandIndex = -1;
     for (let i = 0; i < tokens.length; i++) {
       const token = tokens[i];
+      if (token === "git" || token === "git.exe") continue;
       if (GIT_META_OPTS.has(token)) return false;
       if (GIT_OPTS_BARE.has(token)) continue;
       if (GIT_OPTS_WITH_ARG.has(token)) {
@@ -235,6 +242,8 @@ export default function (pi: ExtensionAPI) {
     return rest;
   };
 
+  const toolError = (text: string) => ({ content: [{ type: "text" as const, text }], details: {}, isError: true });
+
   pi.registerTool({
     name: "git_commit",
     label: "Git Commit",
@@ -257,17 +266,17 @@ export default function (pi: ExtensionAPI) {
         const { type, message } = params;
         const description = stripLeadingCommitType(type, message);
         if (!description) {
-          return { content: [{ type: "text", text: "Commit message must not be empty." }], details: {}, isError: true };
+          return toolError("Commit message must not be empty.");
         }
         const fullMessage = `${type}: ${description}`;
         const addResult = await pi.exec("git", ["add", "."], { signal });
         if (addResult.code !== 0) {
-          return { content: [{ type: "text", text: `Staging failed: ${addResult.stderr}` }], details: {}, isError: true };
+          return toolError(`Staging failed: ${addResult.stderr}`);
         }
 
         const result = await pi.exec("git", ["commit", "-m", fullMessage], { signal });
         if (result.code !== 0) {
-          return { content: [{ type: "text", text: `Commit failed: ${result.stderr}` }], details: {}, isError: true };
+          return toolError(`Commit failed: ${result.stderr}`);
         }
         committed = true;
         pi.sendMessage(
@@ -316,26 +325,28 @@ export default function (pi: ExtensionAPI) {
       }
       commitFlowActive = true;
 
+      const execGit = async (label: string, args: string[]) => {
+        const result = await pi.exec("git", args);
+        if (result.code !== 0) {
+          ctx.ui.notify(`${label} failed: ${result.stderr}`, "error");
+          commitFlowActive = false;
+          return undefined;
+        }
+        return result;
+      };
+
       try {
         await ctx.ui.setWorkingMessage("Waiting for queued messages to complete...");
         await ctx.waitForIdle();
         if (!commitFlowActive) return;
 
         await ctx.ui.setWorkingMessage("Staging files...");
-        const addResult = await pi.exec("git", ["add", "."]);
-        if (addResult.code !== 0) {
-          ctx.ui.notify(`git add failed: ${addResult.stderr}`, "error");
-          commitFlowActive = false;
-          return;
-        }
+        const addResult = await execGit("git add", ["add", "."]);
+        if (!addResult || !commitFlowActive) return;
 
         await ctx.ui.setWorkingMessage("Getting diff...");
-        const diffResult = await pi.exec("git", ["diff", "--staged"]);
-        if (diffResult.code !== 0) {
-          ctx.ui.notify(`git diff failed: ${diffResult.stderr}`, "error");
-          commitFlowActive = false;
-          return;
-        }
+        const diffResult = await execGit("git diff", ["diff", "--staged"]);
+        if (!diffResult || !commitFlowActive) return;
 
         if (!diffResult.stdout.trim()) {
           ctx.ui.notify("Nothing to commit (empty diff). Stage files first.", "warning");
@@ -343,7 +354,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const diff = diffResult.stdout || "(no changes staged)";
+        const diff = diffResult.stdout;
 
         const statResult = await pi.exec("git", ["diff", "--staged", "--stat"]);
         if (!commitFlowActive) return;

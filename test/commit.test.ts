@@ -335,6 +335,13 @@ EOF`;
       expect(await isBlocked(script)).toBe(false);
     });
 
+    it("allows git commands inside backslash-quoted heredocs", async () => {
+      const script = `cat <<\\EOF
+git push origin main
+EOF`;
+      expect(await isBlocked(script)).toBe(false);
+    });
+
     it("allows git in command substitution for read-only commands", async () => {
       expect(await isBlocked("echo $(git rev-parse HEAD)")).toBe(false);
     });
@@ -421,6 +428,13 @@ EOF`;
       expect(await isBlocked("doas -u root git add .")).toBe(true);
     });
 
+    it("blocks repeated git tokens behind wrapper prefixes", async () => {
+      expect(await isBlocked("sudo -u git git push")).toBe(true);
+      expect(await isBlocked("env -u git git push")).toBe(true);
+      expect(await isBlocked("git git push")).toBe(true);
+      expect(await isBlocked("sudo -u git ls")).toBe(false);
+    });
+
     it("blocks git with env var assignments", async () => {
       expect(await isBlocked("VAR=1 git push origin main")).toBe(true);
       expect(await isBlocked("env VAR=1 git push")).toBe(true);
@@ -467,6 +481,27 @@ EOF`;
       expect(await isBlocked("git tag --contains HEAD")).toBe(false);
       expect(await isBlocked("git tag --sort=-creatordate")).toBe(false);
       expect(await isBlocked("git tag -n5")).toBe(false);
+    });
+
+    it("blocks tag mutations hidden after read-only flags", async () => {
+      expect(await isBlocked("git tag --sort=-creatordate -d v1.0")).toBe(true);
+      expect(await isBlocked("git tag -n1 -d v1.0")).toBe(true);
+      expect(await isBlocked("git tag --contains HEAD -a v1.0 -m msg")).toBe(true);
+      expect(await isBlocked("git tag --sort=-creatordate v2.0")).toBe(true);
+      expect(await isBlocked("git tag --color v3.0")).toBe(true);
+      expect(await isBlocked("git tag --format='%(refname)' v4.0")).toBe(true);
+      expect(await isBlocked("git tag --merged main -d v1.0")).toBe(true);
+    });
+
+    it("allows read-only tag listing with values", async () => {
+      expect(await isBlocked("git tag -v v1.0")).toBe(false);
+      expect(await isBlocked("git tag --no-contains HEAD")).toBe(false);
+      expect(await isBlocked("git tag --sort creatordate")).toBe(false);
+      expect(await isBlocked("git tag --format '%(refname)'")).toBe(false);
+      expect(await isBlocked("git tag -i")).toBe(false);
+      expect(await isBlocked("git tag --merged main v5.0")).toBe(false);
+      expect(await isBlocked("git tag --points-at HEAD v5.0")).toBe(false);
+      expect(await isBlocked("git tag --contains=HEAD v5.0")).toBe(false);
     });
 
     it("blocks git config read flags combined with write flags", async () => {
