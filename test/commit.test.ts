@@ -630,14 +630,8 @@ EOF`;
   });
 
   describe("session_start handler", () => {
-    it("ensures git_commit tool is inactive", () => {
-      pi.getActiveTools = vi.fn(() => ["git_commit"]);
-      sessionStartHandler!();
-      expect(pi.setActiveTools).toHaveBeenCalledWith([]);
-    });
-
-    it("leaves active tools untouched when git_commit is already inactive", () => {
-      pi.getActiveTools = vi.fn(() => ["read", "bash"]);
+    it("leaves the active tools untouched so the provider prompt cache stays stable", () => {
+      pi.getActiveTools = vi.fn(() => ["git_commit", "bash"]);
       sessionStartHandler!();
       expect(pi.setActiveTools).not.toHaveBeenCalled();
     });
@@ -686,14 +680,14 @@ EOF`;
       expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
     });
 
-    it("activates git_commit before sending the custom message", async () => {
+    it("sends the custom message without changing the active tools", async () => {
       pi.getActiveTools = vi.fn(() => []);
       pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
       const ctx = createCtx();
 
       await commitCommand()!.cmd.handler("", ctx);
 
-      expect(pi.setActiveTools).toHaveBeenCalledWith(["git_commit"]);
+      expect(pi.setActiveTools).not.toHaveBeenCalled();
       expect(pi.sendMessage).toHaveBeenCalled();
     });
 
@@ -796,22 +790,16 @@ EOF`;
       mod.default(fakePi);
     });
 
-    it("deactivates git_commit and notifies when a flow is active", async () => {
-      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
-      const ctx = createCtx();
-      await stopCommand.handler("", ctx);
-      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
-      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stopped"), "info");
-    });
-
-    it("steers the agent away from committing when the flow reached it", async () => {
-      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+    it("steers the agent away and notifies when a commit flow is active", async () => {
+      fakePi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+      await commitCommand.handler("", createCtx());
       const ctx = createCtx();
       await stopCommand.handler("", ctx);
       expect(fakePi.sendMessage).toHaveBeenCalledWith(
         expect.objectContaining({ display: false, content: expect.stringMatching(/stopped/) }),
         expect.objectContaining({ deliverAs: "steer" }),
       );
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stopped"), "info");
     });
 
     it("notifies that no flow is in progress when none is active", async () => {
@@ -832,7 +820,10 @@ EOF`;
       await stopCommand.handler("", createCtx());
       resolveIdle();
       await commitPromise;
-      expect(fakePi.sendMessage).not.toHaveBeenCalled();
+      expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-diff" }),
+        expect.anything(),
+      );
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
 
@@ -848,7 +839,10 @@ EOF`;
       await stopCommand.handler("", createCtx());
       resolveAdd({ code: 0, stdout: "", stderr: "" });
       await commitPromise;
-      expect(fakePi.sendMessage).not.toHaveBeenCalled();
+      expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-diff" }),
+        expect.anything(),
+      );
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
   });
@@ -857,10 +851,16 @@ EOF`;
     let tempDir: string;
     let tool: any;
     let fakePi: any;
+    let commitCommand: any;
 
     const runGit = (args: string[]) => {
       const result = spawnSync("git", args, { cwd: tempDir, encoding: "utf-8" });
       return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    };
+
+    const startCommitFlow = async () => {
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      await commitCommand.handler("", ctx);
     };
 
     beforeEach(async () => {
@@ -878,7 +878,9 @@ EOF`;
           tool = registered;
         }),
         registerMessageRenderer: vi.fn(),
-        registerCommand: vi.fn(),
+        registerCommand: vi.fn((name: string, cmd: any) => {
+          if (name === "commit") commitCommand = cmd;
+        }),
         getActiveTools: vi.fn(() => []),
         setActiveTools: vi.fn(),
         sendUserMessage: vi.fn(),
@@ -897,6 +899,7 @@ EOF`;
 
     it("stages all changes and commits with the TYPE: prefix", async () => {
       fs.writeFileSync(path.join(tempDir, "a.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "add a.txt" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).toContain("FIX: add a.txt");
@@ -906,6 +909,7 @@ EOF`;
 
     it("reports a failed commit as a tool error", async () => {
       fs.writeFileSync(path.join(tempDir, "b.txt"), "hello");
+      await startCommitFlow();
       runGit(["add", "."]);
       runGit(["commit", "-m", "seed"]);
       const result = await tool.execute("call-1", { type: "IMPROVE", message: "no changes" }, undefined, vi.fn(), {});
@@ -914,21 +918,26 @@ EOF`;
     });
 
     it("rejects an empty commit message", async () => {
+      fs.writeFileSync(path.join(tempDir, "empty.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("empty");
     });
 
-    it("deactivates git_commit after a successful commit", async () => {
-      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+    it("closes the flow after a successful commit so a retry fails", async () => {
       fs.writeFileSync(path.join(tempDir, "c.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "add c.txt" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
-      expect(fakePi.setActiveTools).toHaveBeenCalledWith([]);
+      const again = await tool.execute("call-1", { type: "FIX", message: "add c.txt again" }, undefined, vi.fn(), {});
+      expect(again.isError).toBe(true);
+      expect(again.content[0].text).toContain("No commit flow");
     });
 
     it("steers the model with a minimal completion message after a successful commit", async () => {
       fs.writeFileSync(path.join(tempDir, "e.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "add e.txt" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).not.toContain("deactivated");
@@ -938,9 +947,9 @@ EOF`;
       );
     });
 
-    it("keeps git_commit active after a failed commit", async () => {
-      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+    it("keeps the flow active after a failed commit", async () => {
       fs.writeFileSync(path.join(tempDir, "d.txt"), "hello");
+      await startCommitFlow();
       runGit(["add", "."]);
       runGit(["commit", "-m", "seed"]);
       const result = await tool.execute("call-1", { type: "IMPROVE", message: "no changes" }, undefined, vi.fn(), {});
@@ -948,8 +957,9 @@ EOF`;
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
 
-    it("keeps git_commit active after an empty-message rejection", async () => {
-      fakePi.getActiveTools = vi.fn(() => ["git_commit"]);
+    it("keeps the flow active after an empty-message rejection", async () => {
+      fs.writeFileSync(path.join(tempDir, "d2.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
@@ -957,6 +967,7 @@ EOF`;
 
     it("strips a leading type prefix from the message to avoid duplication", async () => {
       fs.writeFileSync(path.join(tempDir, "f.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "Fix: correct the off-by-one" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: correct the off-by-one");
@@ -964,6 +975,7 @@ EOF`;
 
     it("strips repeated and differently-cased type prefixes", async () => {
       fs.writeFileSync(path.join(tempDir, "g.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "fix: FIX: Fix: correct it" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: correct it");
@@ -971,10 +983,12 @@ EOF`;
 
     it("strips the type prefix for every commit type", async () => {
       fs.writeFileSync(path.join(tempDir, "h1.txt"), "hello");
+      await startCommitFlow();
       let result = await tool.execute("call-1", { type: "IMPROVE", message: "Improve: parser speed" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("IMPROVE: parser speed");
       fs.writeFileSync(path.join(tempDir, "h2.txt"), "hello");
+      await startCommitFlow();
       result = await tool.execute("call-1", { type: "NEW", message: "New: add retry loop" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("NEW: add retry loop");
@@ -982,6 +996,7 @@ EOF`;
 
     it("strips the type word even without a separator", async () => {
       fs.writeFileSync(path.join(tempDir, "i.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "Fix the fixtures loader" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: the fixtures loader");
@@ -989,6 +1004,7 @@ EOF`;
 
     it("strips the type word with dash separators", async () => {
       fs.writeFileSync(path.join(tempDir, "j.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "FIX — harden the retry loop" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: harden the retry loop");
@@ -996,12 +1012,15 @@ EOF`;
 
     it("does not tear the type word out of longer words", async () => {
       fs.writeFileSync(path.join(tempDir, "k.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "fixes the load order" }, undefined, vi.fn(), {});
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: fixes the load order");
     });
 
     it("rejects a message that is only a type prefix", async () => {
+      fs.writeFileSync(path.join(tempDir, "prefix.txt"), "hello");
+      await startCommitFlow();
       const result = await tool.execute("call-1", { type: "FIX", message: "Fix:" }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("empty");

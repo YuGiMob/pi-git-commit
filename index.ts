@@ -217,20 +217,6 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   });
 
-  const activateGitCommit = () => {
-    const activeTools = pi.getActiveTools();
-    if (!activeTools.includes("git_commit")) {
-      pi.setActiveTools([...activeTools, "git_commit"]);
-    }
-  };
-
-  const deactivateGitCommit = () => {
-    const activeTools = pi.getActiveTools();
-    if (activeTools.includes("git_commit")) {
-      pi.setActiveTools(activeTools.filter((tool) => tool !== "git_commit"));
-    }
-  };
-
   const stripLeadingCommitType = (type: string, message: string): string => {
     const typePrefixRe = new RegExp(`^${type}(?!\\p{L})\\s*[:–—\\-]?\\s*`, "iu");
     let rest = message.trim();
@@ -261,6 +247,9 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      if (!commitFlowActive) {
+        return toolError("No commit flow is active. Ask the user to run /commit first.");
+      }
       let committed = false;
       try {
         const { type, message } = params;
@@ -287,7 +276,6 @@ export default function (pi: ExtensionAPI) {
       } finally {
         if (committed) {
           commitFlowActive = false;
-          deactivateGitCommit();
         }
       }
     },
@@ -296,7 +284,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", () => {
     gitBlocked = true;
     commitFlowActive = false;
-    deactivateGitCommit();
   });
 
   pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
@@ -362,7 +349,6 @@ export default function (pi: ExtensionAPI) {
 
         const prompt = `DO NOT use bash for git. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\`\`\`diff\n${diff}\`\`\`\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
         if (!commitFlowActive) return;
-        activateGitCommit();
         pi.sendMessage(
           { customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details: { diff, stat } },
           { deliverAs: "followUp", triggerTurn: true },
@@ -380,17 +366,13 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("stop-commit requires interactive mode", "error");
         return;
       }
-      const toolWasActive = pi.getActiveTools().includes("git_commit");
       const flowWasActive = commitFlowActive;
       commitFlowActive = false;
-      deactivateGitCommit();
-      if (toolWasActive) {
+      if (flowWasActive) {
         pi.sendMessage(
           { customType: "git-commit-stopped", content: "The user stopped the commit flow with /stop-commit. Do not attempt to commit.", display: false },
           { deliverAs: "steer" },
         );
-        ctx.ui.notify("Commit flow stopped. The git_commit tool is deactivated.", "info");
-      } else if (flowWasActive) {
         ctx.ui.notify("Commit flow stopped.", "info");
       } else {
         ctx.ui.notify("No commit flow in progress.", "info");
