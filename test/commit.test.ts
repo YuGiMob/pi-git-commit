@@ -31,7 +31,7 @@ vi.mock("typebox", () => ({
 describe("commit extension", () => {
   let extension: any;
   let pi: any;
-  let capturedTool: any;
+  let capturedTools: any[] = [];
   let capturedMessageRenderer: any;
   let capturedCommands: any[];
   let toolCallHandler: ((event: any) => Promise<any>) | undefined;
@@ -45,6 +45,7 @@ describe("commit extension", () => {
 
   beforeEach(async () => {
     capturedCommands = [];
+    capturedTools = [];
     capturedMessageRenderer = undefined;
     toolCallHandler = undefined;
     sessionStartHandler = undefined;
@@ -54,7 +55,7 @@ describe("commit extension", () => {
         if (event === "session_start") sessionStartHandler = handler;
       }),
       registerTool: vi.fn((tool: any) => {
-        capturedTool = tool;
+        capturedTools.push(tool);
       }),
       registerMessageRenderer: vi.fn((customType: string, renderer: any) => {
         if (customType === "git-commit-diff") capturedMessageRenderer = renderer;
@@ -594,17 +595,42 @@ EOF`;
 
   describe("git_commit tool registration", () => {
     it("registers a tool named git_commit", () => {
-      expect(capturedTool).toBeDefined();
-      expect(capturedTool.name).toBe("git_commit");
+      const commitTool = capturedTools.find((t: any) => t.name === "git_commit");
+      expect(commitTool).toBeDefined();
+      expect(commitTool.name).toBe("git_commit");
     });
 
     it("has FIX, IMPROVE, NEW as type options", () => {
-      expect(capturedTool.parameters.type).toBeDefined();
+      const tool = capturedTools.find((t: any) => t.name === "git_commit");
+      expect(tool.parameters.type).toBeDefined();
     });
 
     it("has a message parameter", () => {
-      expect(capturedTool.parameters.message).toBeDefined();
-      expect(capturedTool.parameters.message.minLength).toBe(1);
+      const tool = capturedTools.find((t: any) => t.name === "git_commit");
+      expect(tool.parameters.message).toBeDefined();
+      expect(tool.parameters.message.minLength).toBe(1);
+    });
+  });
+
+  describe("git_amend tool registration", () => {
+    it("registers a tool named git_amend", () => {
+      const amendTool = capturedTools.find((t: any) => t.name === "git_amend");
+      expect(amendTool).toBeDefined();
+      expect(amendTool.name).toBe("git_amend");
+    });
+
+    it("has the same parameters as git_commit", () => {
+      const amendTool = capturedTools.find((t: any) => t.name === "git_amend");
+      expect(amendTool.parameters.type).toBeDefined();
+      expect(amendTool.parameters.message).toBeDefined();
+      expect(amendTool.parameters.message.minLength).toBe(1);
+    });
+  });
+
+  describe("/amend command registration", () => {
+    it("registers a command named amend", () => {
+      const cmd = capturedCommands.find((c: any) => c.name === "amend");
+      expect(cmd).toBeDefined();
     });
   });
 
@@ -757,6 +783,7 @@ EOF`;
   describe("/stop-commit command handler", () => {
     let stopCommand: any;
     let commitCommand: any;
+    let amendCommand: any;
     let fakePi: any;
 
     function createCtx() {
@@ -780,6 +807,7 @@ EOF`;
         registerCommand: vi.fn((name: string, cmd: any) => {
           if (name === "stop-commit") stopCommand = cmd;
           if (name === "commit") commitCommand = cmd;
+          if (name === "amend") amendCommand = cmd;
         }),
         getActiveTools: vi.fn(() => []),
         setActiveTools: vi.fn(),
@@ -845,6 +873,208 @@ EOF`;
       );
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
+
+    it("aborts a pending /amend flow while it waits for idle", async () => {
+      let resolveIdle!: () => void;
+      const idlePromise = new Promise<void>((resolve) => { resolveIdle = resolve; });
+      const ctx = createCtx();
+      ctx.waitForIdle = vi.fn(() => idlePromise);
+      const amendPromise = amendCommand.handler("better message", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await stopCommand.handler("", createCtx());
+      resolveIdle();
+      await amendPromise;
+      expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-amend-request" }),
+        expect.anything(),
+      );
+      expect(fakePi.setActiveTools).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("git_amend tool integration (real git)", () => {
+    let tempDir: string;
+    let tool: any;
+    let fakePi: any;
+    let amendCommand: any;
+    let stopCommand: any;
+
+    const runGit = (args: string[]) => {
+      const result = spawnSync("git", args, { cwd: tempDir, encoding: "utf-8" });
+      return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    };
+
+    const realExec = (command: string, args: string[], opts?: { cwd?: string }) => {
+      const result = spawnSync(command, args, { cwd: opts?.cwd ?? tempDir, encoding: "utf-8" });
+      return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    };
+
+    const startAmendFlow = async (critique: string) => {
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      await amendCommand.handler(critique, ctx);
+    };
+
+    const seedCommit = (name: string, message: string) => {
+      fs.writeFileSync(path.join(tempDir, name), "hello");
+      runGit(["add", "."]);
+      runGit(["commit", "-m", message]);
+    };
+
+    beforeEach(async () => {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-git-commit-amend-"));
+      runGit(["init", "-b", "main"]);
+      runGit(["config", "user.name", "Test User"]);
+      runGit(["config", "user.email", "test@example.com"]);
+      runGit(["config", "commit.gpgsign", "false"]);
+
+      vi.resetModules();
+      const mod = await import("../index.js");
+      fakePi = {
+        on: vi.fn(),
+        registerTool: vi.fn((registered: any) => {
+          tool = registered;
+        }),
+        registerMessageRenderer: vi.fn(),
+        registerCommand: vi.fn((name: string, cmd: any) => {
+          if (name === "amend") amendCommand = cmd;
+          if (name === "stop-commit") stopCommand = cmd;
+        }),
+        getActiveTools: vi.fn(() => []),
+        setActiveTools: vi.fn(),
+        sendUserMessage: vi.fn(),
+        sendMessage: vi.fn(),
+        exec: vi.fn(realExec),
+      };
+      mod.default(fakePi);
+    });
+
+    afterEach(() => {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("refuses to run without an amend flow", async () => {
+      const result = await tool.execute("call-1", { type: "FIX", message: "rewrite" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("No amend flow");
+    });
+
+    it("sends only the critique to the agent", async () => {
+      seedCommit("a.txt", "seed");
+      await startAmendFlow("the type should be IMPROVE");
+
+      expect(fakePi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          display: false,
+          content: expect.stringContaining("the type should be IMPROVE"),
+        }),
+        expect.objectContaining({ deliverAs: "followUp", triggerTurn: true }),
+      );
+      const request = fakePi.sendMessage.mock.calls[0][0] as { content: string };
+      expect(request.content).not.toContain("seed");
+      expect(request.content).toContain("git_amend");
+      expect(fakePi.exec).not.toHaveBeenCalled();
+    });
+
+    it("amends the last commit message with the TYPE prefix and closes the flow", async () => {
+      seedCommit("b.txt", "seed");
+      await startAmendFlow("mention the retry loop");
+
+      const result = await tool.execute("call-1", { type: "FIX", message: "Fix: correct the retry loop" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: correct the retry loop");
+      expect(runGit(["status", "--porcelain"]).stdout.trim()).toBe("");
+
+      const again = await tool.execute("call-1", { type: "FIX", message: "again" }, undefined, vi.fn(), {});
+      expect(again.isError).toBe(true);
+      expect(again.content[0].text).toContain("No amend flow");
+    });
+
+    it("leaves untracked files untouched while amending", async () => {
+      seedCommit("c.txt", "seed");
+      await startAmendFlow("better message");
+      fs.writeFileSync(path.join(tempDir, "d.txt"), "untracked");
+
+      const result = await tool.execute("call-1", { type: "IMPROVE", message: "better message" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("IMPROVE: better message");
+      expect(runGit(["status", "--porcelain"]).stdout.trim()).toBe("?? d.txt");
+    });
+
+    it("refuses when the index has staged changes and keeps the flow open", async () => {
+      seedCommit("e.txt", "seed");
+      await startAmendFlow("sharpen the message");
+      fs.writeFileSync(path.join(tempDir, "f.txt"), "staged");
+      runGit(["add", "."]);
+
+      const result = await tool.execute("call-1", { type: "FIX", message: "sharpened" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("staged");
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("seed");
+
+      runGit(["reset"]);
+      const retry = await tool.execute("call-1", { type: "FIX", message: "sharpened" }, undefined, vi.fn(), {});
+      expect(retry.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: sharpened");
+    });
+
+    it("keeps the flow open after a failed amend so the agent can retry", async () => {
+      seedCommit("g.txt", "seed");
+      await startAmendFlow("fix the message");
+
+      fakePi.exec = vi.fn(async (_command: string, args: string[]) => {
+        if (args[0] === "commit") return { code: 1, stdout: "", stderr: "boom" };
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      const failed = await tool.execute("call-1", { type: "FIX", message: "boom message" }, undefined, vi.fn(), {});
+      expect(failed.isError).toBe(true);
+      expect(failed.content[0].text).toContain("Amend failed");
+
+      fakePi.exec = realExec;
+      const retry = await tool.execute("call-1", { type: "FIX", message: "real message" }, undefined, vi.fn(), {});
+      expect(retry.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: real message");
+    });
+
+    it("rejects an empty message without closing the flow", async () => {
+      seedCommit("h.txt", "seed");
+      await startAmendFlow("fix");
+      const result = await tool.execute("call-1", { type: "FIX", message: "   " }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      const retry = await tool.execute("call-1", { type: "FIX", message: "real message" }, undefined, vi.fn(), {});
+      expect(retry.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: real message");
+    });
+
+    it("opens no flow when /amend is called without a critique", async () => {
+      seedCommit("i.txt", "seed");
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      await amendCommand.handler("", ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("/amend"), "error");
+      expect(fakePi.sendMessage).not.toHaveBeenCalled();
+
+      const result = await tool.execute("call-1", { type: "FIX", message: "no flow" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("No amend flow");
+    });
+
+    it("opens the flow without running any git command", async () => {
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      await amendCommand.handler("anything", ctx);
+      expect(fakePi.exec).not.toHaveBeenCalled();
+      expect(fakePi.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("aborts a pending amend flow via /stop-commit", async () => {
+      seedCommit("j.txt", "seed");
+      await startAmendFlow("initial critique");
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      await stopCommand.handler("", ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stopped"), "info");
+
+      const result = await tool.execute("call-1", { type: "FIX", message: "should fail" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("No amend flow");
+    });
   });
 
   describe("git_commit tool integration (real git)", () => {
@@ -875,7 +1105,7 @@ EOF`;
       fakePi = {
         on: vi.fn(),
         registerTool: vi.fn((registered: any) => {
-          tool = registered;
+          if (registered.name === "git_commit") tool = registered;
         }),
         registerMessageRenderer: vi.fn(),
         registerCommand: vi.fn((name: string, cmd: any) => {

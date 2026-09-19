@@ -8,6 +8,7 @@ const DIFF_CUSTOM_TYPE = "git-commit-diff";
 export default function (pi: ExtensionAPI) {
   let gitBlocked = true;
   let commitFlowActive = false;
+  let amendFlowActive = false;
 
   const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec"]);
   const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
@@ -281,9 +282,60 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "git_amend",
+    label: "Git Amend",
+    description: "Amend the message of the last commit. Only use when the user has run /amend and asked you to amend. Do not call this tool unprompted.",
+    promptSnippet: "Amend the last commit message (only after user runs /amend)",
+    promptGuidelines: [
+      "Only use git_amend when the user explicitly asks you to amend after they ran /amend",
+      "Do not call git_amend on its own — wait for the user to run /amend first",
+    ],
+    parameters: Type.Object({
+      type: Type.Union(COMMIT_TYPES.map((t) => Type.Literal(t))),
+      message: Type.String({
+        minLength: 1,
+        description: "Corrected commit message (imperative mood). Multi-line allowed for detailed changes.",
+      }),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      if (!amendFlowActive) {
+        return toolError("No amend flow is active. Ask the user to run /amend first.");
+      }
+      let amended = false;
+      try {
+        const { type, message } = params;
+        const description = stripLeadingCommitType(type, message);
+        if (!description) {
+          return toolError("Commit message must not be empty.");
+        }
+        const fullMessage = `${type}: ${description}`;
+        const stagedResult = await pi.exec("git", ["diff", "--cached", "--quiet"], { signal });
+        if (stagedResult.code !== 0) {
+          return toolError("The index has staged changes. Amending would fold them into the last commit. Unstage them first or use /commit.");
+        }
+        const result = await pi.exec("git", ["commit", "--amend", "-m", fullMessage], { signal });
+        if (result.code !== 0) {
+          return toolError(`Amend failed: ${result.stderr}`);
+        }
+        amended = true;
+        pi.sendMessage(
+          { customType: "git-amend-flow-complete", content: "The amend flow is complete.", display: false },
+          { deliverAs: "steer" },
+        );
+        return { content: [{ type: "text", text: `✓ Amended: ${fullMessage}` }], details: {} };
+      } finally {
+        if (amended) {
+          amendFlowActive = false;
+        }
+      }
+    },
+  });
+
   pi.on("session_start", () => {
     gitBlocked = true;
     commitFlowActive = false;
+    amendFlowActive = false;
   });
 
   pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
@@ -360,22 +412,53 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("stop-commit", {
-    description: "Stop the pending commit flow started by /commit",
+    description: "Stop the pending commit or amend flow started by /commit or /amend",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("stop-commit requires interactive mode", "error");
         return;
       }
-      const flowWasActive = commitFlowActive;
+      const flowWasActive = commitFlowActive || amendFlowActive;
       commitFlowActive = false;
+      amendFlowActive = false;
       if (flowWasActive) {
         pi.sendMessage(
-          { customType: "git-commit-stopped", content: "The user stopped the commit flow with /stop-commit. Do not attempt to commit.", display: false },
+          { customType: "git-commit-stopped", content: "The user stopped the pending flow with /stop-commit. Do not attempt to commit or amend.", display: false },
           { deliverAs: "steer" },
         );
-        ctx.ui.notify("Commit flow stopped.", "info");
+        ctx.ui.notify("Flow stopped.", "info");
       } else {
         ctx.ui.notify("No commit flow in progress.", "info");
+      }
+    },
+  });
+
+  pi.registerCommand("amend", {
+    description: "Send your critique of the last commit message to the agent for git_amend",
+    handler: async (args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("amend requires interactive mode", "error");
+        return;
+      }
+      const critique = args.trim();
+      if (!critique) {
+        ctx.ui.notify("Add a critique of the commit message: /amend <what to change>", "error");
+        return;
+      }
+      amendFlowActive = true;
+
+      try {
+        await ctx.ui.setWorkingMessage("Waiting for queued messages to complete...");
+        await ctx.waitForIdle();
+        if (!amendFlowActive) return;
+
+        const prompt = `DO NOT use bash for git. Use ONLY the \`git_amend\` tool.\n\nThe user wants the last commit message changed.\n\nUser critique: ${critique}\n\nChoose the right type (FIX, IMPROVE, or NEW), write a corrected message that answers the critique, and call \`git_amend\` with it. Do not change the committed content.`;
+        pi.sendMessage(
+          { customType: "git-amend-request", content: prompt, display: false },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      } finally {
+        ctx.ui.setWorkingMessage();
       }
     },
   });
