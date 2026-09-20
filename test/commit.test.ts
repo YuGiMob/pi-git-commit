@@ -15,6 +15,28 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   },
   keyHint: (id: string, description: string) => `${id} (${description})`,
   renderDiff: (text: string) => text,
+  truncateHead: (content: string, options?: { maxLines?: number; maxBytes?: number }) => {
+    const maxLines = options?.maxLines ?? 2000;
+    const maxBytes = options?.maxBytes ?? 50 * 1024;
+    const lines = content.length === 0 ? [] : content.split("\n");
+    if (content.endsWith("\n")) lines.pop();
+    const totalBytes = Buffer.byteLength(content, "utf-8");
+    if (lines.length <= maxLines && totalBytes <= maxBytes) {
+      return { content, truncated: false, truncatedBy: null, totalLines: lines.length, totalBytes, outputLines: lines.length, outputBytes: totalBytes, lastLinePartial: false, firstLineExceedsLimit: false, maxLines, maxBytes };
+    }
+    const kept: string[] = [];
+    let bytes = 0;
+    for (const line of lines) {
+      if (kept.length >= maxLines) break;
+      const lineBytes = Buffer.byteLength(line, "utf-8") + (kept.length > 0 ? 1 : 0);
+      if (bytes + lineBytes > maxBytes) break;
+      kept.push(line);
+      bytes += lineBytes;
+    }
+    const output = kept.join("\n");
+    return { content: output, truncated: true, truncatedBy: kept.length >= maxLines ? "lines" : "bytes", totalLines: lines.length, totalBytes, outputLines: kept.length, outputBytes: Buffer.byteLength(output, "utf-8"), lastLinePartial: false, firstLineExceedsLimit: false, maxLines, maxBytes };
+  },
+  formatSize: (bytes: number) => `${bytes}B`,
 }));
 
 vi.mock("typebox", () => ({
@@ -702,8 +724,47 @@ EOF`;
         }),
         expect.objectContaining({ deliverAs: "followUp", triggerTurn: true }),
       );
+      const sent = pi.sendMessage.mock.calls[0][0] as { content: string };
+      expect(sent.content).toContain("1 file changed, 1 insertion(+)");
       expect(pi.sendUserMessage).not.toHaveBeenCalled();
       expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
+    });
+
+    it("omits a diff over the preview budget and keeps only the capped stat", async () => {
+      const hugeDiff = ["diff --git a/big b/big", "--- a/big", "+++ b/big", ...Array.from({ length: 2500 }, (_, index) => `+line ${index}`)].join("\n");
+      const hugeStat = [...Array.from({ length: 150 }, (_, index) => ` file${index}.txt | 1 +`), " 150 files changed, 2500 insertions(+)"].join("\n");
+      pi.exec = vi.fn()
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: hugeDiff, stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: hugeStat, stderr: "" });
+      const ctx = createCtx();
+
+      await commitCommand()!.cmd.handler("", ctx);
+
+      const sent = pi.sendMessage.mock.calls[0][0] as { content: string; details: { diff?: string; stat: string; note?: string } };
+      expect(sent.content).toContain("Review staged changes");
+      expect(sent.content).toContain("[Diff omitted: over the 2000 line / 50KB preview budget");
+      expect(sent.content).not.toContain("diff --git");
+      expect(sent.content).toContain("[Stat truncated: showing 100 of 151 lines");
+      expect(sent.details.diff).toBeUndefined();
+      expect(sent.details.note).toContain("[Diff omitted:");
+      expect(sent.details.stat).toContain("[Stat truncated:");
+    });
+
+    it("includes the full diff when it fits the preview budget", async () => {
+      const fittingDiff = ["diff --git a/x b/x", "--- a/x", "+++ b/x", ...Array.from({ length: 1997 }, (_, index) => `+line ${index}`)].join("\n");
+      pi.exec = vi.fn()
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: fittingDiff, stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: " 1 file changed, 1997 insertions(+)", stderr: "" });
+      const ctx = createCtx();
+
+      await commitCommand()!.cmd.handler("", ctx);
+
+      const sent = pi.sendMessage.mock.calls[0][0] as { content: string; details: { diff?: string } };
+      expect(sent.content).not.toContain("[Diff omitted");
+      expect(sent.content).toContain("+line 1996");
+      expect(sent.details.diff).toBe(fittingDiff);
     });
 
     it("sends the custom message without changing the active tools", async () => {
@@ -777,6 +838,16 @@ EOF`;
       const text = box.render(80).join("\n");
       expect(text).toContain("diff --git a/x b/x");
       expect(text).toContain("+hello");
+    });
+
+    it("shows the omission note when the diff was too large to attach", () => {
+      const box = capturedMessageRenderer(
+        { content: "Review staged changes", details: { stat: "1 file changed", note: "[Diff omitted: over budget]" } },
+        { expanded: true, outputPad: 0 },
+        theme,
+      );
+      const text = box.render(80).join("\n");
+      expect(text).toContain("[Diff omitted: over budget]");
     });
   });
 

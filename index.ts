@@ -1,9 +1,14 @@
-import { keyHint, renderDiff, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
 const DIFF_CUSTOM_TYPE = "git-commit-diff";
+const DIFF_PREVIEW_LINES = 2000;
+const DIFF_PREVIEW_BYTES = 50 * 1024;
+const STAT_PREVIEW_LINES = 100;
+const STAT_PREVIEW_BYTES = 8 * 1024;
+const DIFF_OMITTED_NOTE = `[Diff omitted: over the ${DIFF_PREVIEW_LINES} line / ${DIFF_PREVIEW_BYTES / 1024}KB preview budget. Inspect individual files with read-only \`git diff --staged -- <path>\`.]`;
 
 export default function (pi: ExtensionAPI) {
   let gitBlocked = true;
@@ -231,6 +236,15 @@ export default function (pi: ExtensionAPI) {
 
   const toolError = (text: string) => ({ content: [{ type: "text" as const, text }], details: {}, isError: true });
 
+  const capStat = (stat: string): string => {
+    const capped = truncateHead(stat, { maxLines: STAT_PREVIEW_LINES, maxBytes: STAT_PREVIEW_BYTES });
+    if (!capped.truncated) return stat;
+    return `${capped.content}\n\n[Stat truncated: showing ${capped.outputLines} of ${capped.totalLines} lines (${formatSize(capped.totalBytes)} total).]`;
+  };
+
+  const previewDiff = (diff: string): string | undefined =>
+    truncateHead(diff, { maxLines: DIFF_PREVIEW_LINES, maxBytes: DIFF_PREVIEW_BYTES }).truncated ? undefined : diff;
+
   pi.registerTool({
     name: "git_commit",
     label: "Git Commit",
@@ -339,12 +353,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const details = message.details as { diff?: string; stat?: string } | undefined;
+    const details = message.details as { diff?: string; stat?: string; note?: string } | undefined;
     const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
     box.addChild(new Text(theme.fg("accent", "Staged changes"), 0, 0));
     if (expanded) {
       if (details?.diff) {
         box.addChild(new Text(renderDiff(details.diff), 0, 0));
+      } else if (details?.note) {
+        box.addChild(new Text(theme.fg("dim", details.note), 0, 0));
       }
     } else {
       if (details?.stat) {
@@ -386,23 +402,22 @@ export default function (pi: ExtensionAPI) {
         await ctx.ui.setWorkingMessage("Getting diff...");
         const diffResult = await execGit("git diff", ["diff", "--staged"]);
         if (!diffResult || !commitFlowActive) return;
-
         if (!diffResult.stdout.trim()) {
           ctx.ui.notify("Nothing to commit (empty diff). Stage files first.", "warning");
           commitFlowActive = false;
           return;
         }
 
-        const diff = diffResult.stdout;
-
         const statResult = await pi.exec("git", ["diff", "--staged", "--stat"]);
         if (!commitFlowActive) return;
-        const stat = statResult.code === 0 ? statResult.stdout.trim().split("\n").pop() ?? "" : "";
+        const stat = statResult.code === 0 ? capStat(statResult.stdout.trim()) : "";
+        const diff = previewDiff(diffResult.stdout);
+        const diffSection = diff === undefined ? DIFF_OMITTED_NOTE : `\`\`\`diff\n${diff}\n\`\`\``;
 
-        const prompt = `DO NOT use bash for git. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\`\`\`diff\n${diff}\`\`\`\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
+        const prompt = `DO NOT use bash to stage or commit. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\n\`\`\`\n${stat}\n\`\`\`\n\n${diffSection}\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
         if (!commitFlowActive) return;
         pi.sendMessage(
-          { customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details: { diff, stat } },
+          { customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details: diff === undefined ? { stat, note: DIFF_OMITTED_NOTE } : { diff, stat } },
           { deliverAs: "followUp", triggerTurn: true },
         );
       } finally {
