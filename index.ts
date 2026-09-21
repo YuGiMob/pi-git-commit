@@ -213,7 +213,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("tool_call", async (event) => {
-    if (event.toolName !== "bash") return undefined;
+    if (event.toolName !== "bash" && event.toolName !== "powershell") return undefined;
     const command = event.input.command;
     if (typeof command !== "string") return undefined;
     const trimmed = command.trim();

@@ -59,9 +59,9 @@ describe("commit extension", () => {
   let toolCallHandler: ((event: any) => Promise<any>) | undefined;
   let sessionStartHandler: (() => void) | undefined;
 
-  async function isBlocked(command: string): Promise<boolean> {
+  async function isBlocked(command: string, toolName = "bash"): Promise<boolean> {
     if (!toolCallHandler) return false;
-    const result = await toolCallHandler({ toolName: "bash", input: { command } });
+    const result = await toolCallHandler({ toolName, input: { command } });
     return result?.block === true;
   }
 
@@ -343,6 +343,12 @@ describe("commit extension", () => {
 
     it("allows non-git commands", async () => {
       expect(await isBlocked("ls -la")).toBe(false);
+    });
+
+    it("blocks mutative git commands in the powershell tool", async () => {
+      expect(await isBlocked("git push", "powershell")).toBe(true);
+      expect(await isBlocked("git -C /tmp/repo reset --hard", "powershell")).toBe(true);
+      expect(await isBlocked("git status", "powershell")).toBe(false);
     });
 
     it("allows git commands mentioned inside strings", async () => {
