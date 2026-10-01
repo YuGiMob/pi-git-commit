@@ -707,6 +707,7 @@ EOF`;
         ui: {
           notify: vi.fn(),
           setWorkingMessage: vi.fn(),
+          onTerminalInput: vi.fn(() => () => {}),
         },
         waitForIdle: vi.fn(),
       };
@@ -863,18 +864,26 @@ EOF`;
     let amendCommand: any;
     let fakePi: any;
 
+    let terminalInputHandler: ((data: string) => unknown) | undefined;
     function createCtx() {
       return {
         hasUI: true,
         ui: {
           notify: vi.fn(),
           setWorkingMessage: vi.fn(),
+          onTerminalInput: vi.fn((handler: (data: string) => unknown) => {
+            terminalInputHandler = handler;
+            return () => {
+              terminalInputHandler = undefined;
+            };
+          }),
         },
         waitForIdle: vi.fn(),
       };
     }
 
     beforeEach(async () => {
+      terminalInputHandler = undefined;
       vi.resetModules();
       const mod = await import("../index.js");
       fakePi = {
@@ -967,6 +976,83 @@ EOF`;
       );
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
     });
+
+    it("cancels a pending /commit flow when escape is pressed", async () => {
+      let resolveIdle!: () => void;
+      const idlePromise = new Promise<void>((resolve) => { resolveIdle = resolve; });
+      const ctx = createCtx();
+      ctx.waitForIdle = vi.fn(() => idlePromise);
+      fakePi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+
+      const commitPromise = commitCommand.handler("", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      terminalInputHandler!("\x1b");
+      resolveIdle();
+      await commitPromise;
+
+      expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-diff" }),
+        expect.anything(),
+      );
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Commit flow stopped"), "info");
+      expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
+    });
+
+    it("cancels a pending /amend flow when escape is pressed", async () => {
+      let resolveIdle!: () => void;
+      const idlePromise = new Promise<void>((resolve) => { resolveIdle = resolve; });
+      const ctx = createCtx();
+      ctx.waitForIdle = vi.fn(() => idlePromise);
+
+      const amendPromise = amendCommand.handler("better message", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      terminalInputHandler!("\x1b");
+      resolveIdle();
+      await amendPromise;
+
+      expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-amend-request" }),
+        expect.anything(),
+      );
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Amend flow stopped"), "info");
+      expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
+    });
+
+    it("clears the custom working message when the flow is stopped", async () => {
+      let resolveIdle!: () => void;
+      const idlePromise = new Promise<void>((resolve) => { resolveIdle = resolve; });
+      const ctx = createCtx();
+      ctx.waitForIdle = vi.fn(() => idlePromise);
+      fakePi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+
+      const commitPromise = commitCommand.handler("", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(ctx.ui.setWorkingMessage).toHaveBeenCalledWith("Waiting for queued messages to complete...");
+
+      const stopCtx = createCtx();
+      await stopCommand.handler("", stopCtx);
+      expect(stopCtx.ui.setWorkingMessage).toHaveBeenCalledWith();
+
+      resolveIdle();
+      await commitPromise;
+    });
+
+    it("closes the flow when escape is pressed after the diff was sent", async () => {
+      fakePi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+      const ctx = createCtx();
+      await commitCommand.handler("", ctx);
+      expect(fakePi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-diff" }),
+        expect.anything(),
+      );
+
+      terminalInputHandler!("\x1b");
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Commit flow stopped"), "info");
+
+      const stopCtx = createCtx();
+      await stopCommand.handler("", stopCtx);
+      expect(stopCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("No commit flow"), "info");
+    });
   });
 
   describe("git_amend tool integration (real git)", () => {
@@ -987,7 +1073,7 @@ EOF`;
     };
 
     const startAmendFlow = async (critique: string) => {
-      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
       await amendCommand.handler(critique, ctx);
     };
 
@@ -1124,7 +1210,7 @@ EOF`;
 
     it("opens no flow when /amend is called without a critique", async () => {
       seedCommit("i.txt", "seed");
-      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
       await amendCommand.handler("", ctx);
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("/amend"), "error");
       expect(fakePi.sendMessage).not.toHaveBeenCalled();
@@ -1135,7 +1221,7 @@ EOF`;
     });
 
     it("opens the flow without running any git command", async () => {
-      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
       await amendCommand.handler("anything", ctx);
       expect(fakePi.exec).not.toHaveBeenCalled();
       expect(fakePi.sendMessage).toHaveBeenCalledTimes(1);
@@ -1144,7 +1230,7 @@ EOF`;
     it("aborts a pending amend flow via /stop-commit", async () => {
       seedCommit("j.txt", "seed");
       await startAmendFlow("initial critique");
-      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
       await stopCommand.handler("", ctx);
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stopped"), "info");
 
@@ -1166,7 +1252,7 @@ EOF`;
     };
 
     const startCommitFlow = async () => {
-      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn() }, waitForIdle: vi.fn() };
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
       await commitCommand.handler("", ctx);
     };
 

@@ -7,9 +7,9 @@ Keeps mutative git operations out of the agent's bash and provides a safe, revie
 - **Bash git guard.** Mutative git commands are blocked in the agent's bash and powershell tools — `add`, `stage`, `commit`, `push`, `pull`, `merge`, `rebase`, `reset`, `clean`, `rm`, `restore`, `switch`, `cherry-pick`, `revert`, `mv`, `init`, `clone`, index/object plumbing (`read-tree`, `checkout-index`, `merge-file`, `prune-packed`), plus mutative forms of `branch` (including creation, `-u`, `-f`, `-c`/`-C`/`--copy`, `-D`/`-M`, `--force`, `-t`/`--track`), `tag` (including creation), `checkout` (including whole-tree restores like `checkout -- .`), `stash`, `submodule`, `worktree`, `config`, `remote`, `apply`, `notes`, `update-ref`, `gc` and more. Read-only commands (`status`, `diff`, `log`, `fetch`, `branch`, `tag`, `stash list`, ...) stay allowed.
 - **`git_commit` tool.** The agent stages everything and commits with a `FIX` / `IMPROVE` / `NEW` type prefix. The tool stays active for the whole session but refuses to run until `/commit` opens the flow, and it refuses again once the commit succeeds. The active tool set never changes mid-session, so the provider prompt cache is never invalidated.
 - **`git_amend` tool.** Same `type` / `message` parameters as `git_commit`, but it only rewrites the last commit's message via `git commit --amend`: it stages nothing, refuses when the index already has staged changes, and never touches the committed content. Gated like `git_commit`: it refuses until `/amend` opens the flow and refuses again once the amend succeeds.
-- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows a collapsed summary of the staged diff (a `git diff --stat` file list; press `ctrl+o` to expand the diff preview), unlocks the `git_commit` tool, and asks the agent to review the changes and commit via `git_commit` — never via bash. The full diff reaches the agent only when it fits pi's tool limits (2000 lines / 50KB); larger diffs are left out of the context entirely and the agent gets just the stat file list (capped at 100 lines / 8KB), so a giant change can never blow up the session. Run `/stop-commit` at any point to abort the flow.
+- **`/commit` command.** Waits for queued messages to finish, stages all changes, shows a collapsed summary of the staged diff (a `git diff --stat` file list; press `ctrl+o` to expand the diff preview), unlocks the `git_commit` tool, and asks the agent to review the changes and commit via `git_commit` — never via bash. The full diff reaches the agent only when it fits pi's tool limits (2000 lines / 50KB); larger diffs are left out of the context entirely and the agent gets just the stat file list (capped at 100 lines / 8KB), so a giant change can never blow up the session. Run `/stop-commit` or press `escape` at any point to abort the flow before it starts and to clear the working message.
 - **`/amend` command.** `/amend <critique>` sends the agent your critique of the last commit message and asks it to fix the message with `git_amend` — never via bash. Run `/stop-commit` to abort a pending amend.
-- **`/stop-commit` command.** Aborts a pending commit or amend flow: closes the flow so `git_commit` and `git_amend` refuse to run, and cancels a `/commit` or `/amend` that is still waiting for queued messages, so nothing is changed.
+- **`/stop-commit` command.** Aborts a pending commit or amend flow: closes the flow so `git_commit` and `git_amend` refuse to run, cancels a `/commit` or `/amend` that is still waiting for queued messages, so nothing is changed, and clears the flow's working message immediately. Pressing `escape` while a flow is pending or active does the same.
 - **`/toggle-allow-git` command.** Temporarily allows mutative git commands in bash for the current session. The guard re-arms on the next session.
 
 ## Quick start
@@ -31,7 +31,7 @@ Keeps mutative git operations out of the agent's bash and provides a safe, revie
 }
 ```
 
-4. Changed your mind? Run `/stop-commit` to abort the flow before the agent commits.
+4. Changed your mind? Run `/stop-commit` or press `escape` to abort the flow before the agent commits.
 
 5. If you need to run mutative git yourself, allow it for the session:
 
@@ -81,7 +81,7 @@ Mutative git commands are blocked. Ask the user to run /toggle-allow-git to allo
 ## Troubleshooting
 
 - **The agent refuses to commit.** The guard blocks `git commit` in bash by design. Run `/commit` and let the agent use the `git_commit` tool.
-- **The agent stopped committing.** You ran `/stop-commit`, which aborted the pending flow. Run `/commit` again to start a new one.
+- **The agent stopped committing.** You ran `/stop-commit` or pressed `escape`, which aborted the pending flow. Run `/commit` again to start a new one.
 - **Prompt cache misses (sudden cost/latency spikes) after /commit.** Older versions activated and deactivated the `git_commit` tool per flow, which rebuilt pi's system prompt and invalidated the provider's cached prompt prefix. Update to this version: the tool set now never changes mid-session.
 - **"Nothing to commit (empty diff)."** There are no staged changes — make edits first, then run `/commit` again.
 - **I need git in bash right now.** Run `/toggle-allow-git`; the guard re-arms automatically on the next session start.

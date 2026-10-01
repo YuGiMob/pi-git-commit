@@ -1,5 +1,5 @@
-import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Box, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
@@ -14,6 +14,7 @@ export default function (pi: ExtensionAPI) {
   let gitBlocked = true;
   let commitFlowActive = false;
   let amendFlowActive = false;
+  let stopInputListener: (() => void) | undefined;
 
   const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec"]);
   const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
@@ -245,6 +246,30 @@ export default function (pi: ExtensionAPI) {
   const previewDiff = (diff: string): string | undefined =>
     truncateHead(diff, { maxLines: DIFF_PREVIEW_LINES, maxBytes: DIFF_PREVIEW_BYTES }).truncated ? undefined : diff;
 
+  const clearStopListener = () => {
+    stopInputListener?.();
+    stopInputListener = undefined;
+  };
+
+  const closeFlows = () => {
+    commitFlowActive = false;
+    amendFlowActive = false;
+    clearStopListener();
+  };
+
+  const watchForEscape = (ctx: ExtensionCommandContext) => {
+    clearStopListener();
+    stopInputListener = ctx.ui.onTerminalInput((data) => {
+      if (!commitFlowActive && !amendFlowActive) return undefined;
+      if (!matchesKey(data, "escape")) return undefined;
+      const flowName = commitFlowActive ? "Commit" : "Amend";
+      closeFlows();
+      ctx.ui.setWorkingMessage();
+      ctx.ui.notify(`${flowName} flow stopped.`, "info");
+      return undefined;
+    });
+  };
+
   pi.registerTool({
     name: "git_commit",
     label: "Git Commit",
@@ -290,7 +315,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `✓ Committed: ${fullMessage}` }], details: {} };
       } finally {
         if (committed) {
-          commitFlowActive = false;
+          closeFlows();
         }
       }
     },
@@ -340,7 +365,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `✓ Amended: ${fullMessage}` }], details: {} };
       } finally {
         if (amended) {
-          amendFlowActive = false;
+          closeFlows();
         }
       }
     },
@@ -348,8 +373,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", () => {
     gitBlocked = true;
-    commitFlowActive = false;
-    amendFlowActive = false;
+    closeFlows();
   });
 
   pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
@@ -379,12 +403,13 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       commitFlowActive = true;
+      watchForEscape(ctx);
 
       const execGit = async (label: string, args: string[]) => {
         const result = await pi.exec("git", args);
         if (result.code !== 0) {
           ctx.ui.notify(`${label} failed: ${result.stderr}`, "error");
-          commitFlowActive = false;
+          closeFlows();
           return undefined;
         }
         return result;
@@ -404,7 +429,7 @@ export default function (pi: ExtensionAPI) {
         if (!diffResult || !commitFlowActive) return;
         if (!diffResult.stdout.trim()) {
           ctx.ui.notify("Nothing to commit (empty diff). Stage files first.", "warning");
-          commitFlowActive = false;
+          closeFlows();
           return;
         }
 
@@ -434,9 +459,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const flowWasActive = commitFlowActive || amendFlowActive;
-      commitFlowActive = false;
-      amendFlowActive = false;
+      closeFlows();
       if (flowWasActive) {
+        ctx.ui.setWorkingMessage();
         pi.sendMessage(
           { customType: "git-commit-stopped", content: "The user stopped the pending flow with /stop-commit. Do not attempt to commit or amend.", display: false },
           { deliverAs: "steer" },
@@ -461,6 +486,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       amendFlowActive = true;
+      watchForEscape(ctx);
 
       try {
         await ctx.ui.setWorkingMessage("Waiting for queued messages to complete...");
