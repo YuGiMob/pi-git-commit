@@ -257,6 +257,13 @@ export default function (pi: ExtensionAPI) {
     clearStopListener();
   };
 
+  const sendFlowStopped = (stoppedBy: string) => {
+    pi.sendMessage(
+      { customType: "git-commit-stopped", content: `The user stopped the pending flow ${stoppedBy}. Do not attempt to commit or amend.`, display: false },
+      { deliverAs: "steer" },
+    );
+  };
+
   const watchForEscape = (ctx: ExtensionCommandContext) => {
     clearStopListener();
     stopInputListener = ctx.ui.onTerminalInput((data) => {
@@ -265,6 +272,7 @@ export default function (pi: ExtensionAPI) {
       const flowName = commitFlowActive ? "Commit" : "Amend";
       closeFlows();
       ctx.ui.setWorkingMessage();
+      sendFlowStopped("by pressing escape");
       ctx.ui.notify(`${flowName} flow stopped.`, "info");
       return undefined;
     });
@@ -462,10 +470,7 @@ export default function (pi: ExtensionAPI) {
       closeFlows();
       if (flowWasActive) {
         ctx.ui.setWorkingMessage();
-        pi.sendMessage(
-          { customType: "git-commit-stopped", content: "The user stopped the pending flow with /stop-commit. Do not attempt to commit or amend.", display: false },
-          { deliverAs: "steer" },
-        );
+        sendFlowStopped("with /stop-commit");
         ctx.ui.notify("Flow stopped.", "info");
       } else {
         ctx.ui.notify("No commit flow in progress.", "info");

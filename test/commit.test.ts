@@ -910,7 +910,7 @@ EOF`;
       const ctx = createCtx();
       await stopCommand.handler("", ctx);
       expect(fakePi.sendMessage).toHaveBeenCalledWith(
-        expect.objectContaining({ display: false, content: expect.stringMatching(/stopped/) }),
+        expect.objectContaining({ customType: "git-commit-stopped", display: false, content: expect.stringContaining("/stop-commit") }),
         expect.objectContaining({ deliverAs: "steer" }),
       );
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stopped"), "info");
@@ -986,7 +986,10 @@ EOF`;
 
       const commitPromise = commitCommand.handler("", ctx);
       await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(ctx.ui.setWorkingMessage).toHaveBeenCalledWith("Waiting for queued messages to complete...");
+
       terminalInputHandler!("\x1b");
+      expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
       resolveIdle();
       await commitPromise;
 
@@ -994,8 +997,11 @@ EOF`;
         expect.objectContaining({ customType: "git-commit-diff" }),
         expect.anything(),
       );
+      expect(fakePi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-stopped", display: false, content: expect.stringContaining("escape") }),
+        expect.objectContaining({ deliverAs: "steer" }),
+      );
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Commit flow stopped"), "info");
-      expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
     });
 
     it("cancels a pending /amend flow when escape is pressed", async () => {
@@ -1006,7 +1012,10 @@ EOF`;
 
       const amendPromise = amendCommand.handler("better message", ctx);
       await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(ctx.ui.setWorkingMessage).toHaveBeenCalledWith("Waiting for queued messages to complete...");
+
       terminalInputHandler!("\x1b");
+      expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
       resolveIdle();
       await amendPromise;
 
@@ -1014,8 +1023,11 @@ EOF`;
         expect.objectContaining({ customType: "git-amend-request" }),
         expect.anything(),
       );
+      expect(fakePi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-stopped", display: false, content: expect.stringContaining("escape") }),
+        expect.objectContaining({ deliverAs: "steer" }),
+      );
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Amend flow stopped"), "info");
-      expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
     });
 
     it("clears the custom working message when the flow is stopped", async () => {
@@ -1048,6 +1060,11 @@ EOF`;
 
       terminalInputHandler!("\x1b");
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Commit flow stopped"), "info");
+      expect(fakePi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-stopped", display: false, content: expect.stringContaining("escape") }),
+        expect.objectContaining({ deliverAs: "steer" }),
+      );
+      expect(terminalInputHandler).toBeUndefined();
 
       const stopCtx = createCtx();
       await stopCommand.handler("", stopCtx);
@@ -1245,6 +1262,7 @@ EOF`;
     let tool: any;
     let fakePi: any;
     let commitCommand: any;
+    let terminalInputHandler: ((data: string) => unknown) | undefined;
 
     const runGit = (args: string[]) => {
       const result = spawnSync("git", args, { cwd: tempDir, encoding: "utf-8" });
@@ -1252,7 +1270,7 @@ EOF`;
     };
 
     const startCommitFlow = async () => {
-      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn((handler: (data: string) => unknown) => { terminalInputHandler = handler; return () => { terminalInputHandler = undefined; }; }) }, waitForIdle: vi.fn() };
       await commitCommand.handler("", ctx);
     };
 
@@ -1417,6 +1435,19 @@ EOF`;
       const result = await tool.execute("call-1", { type: "FIX", message: "Fix:" }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("empty");
+    });
+
+    it("refuses to commit after escape closed the flow", async () => {
+      fs.writeFileSync(path.join(tempDir, "escape.txt"), "hello");
+      await startCommitFlow();
+      terminalInputHandler!("\x1b");
+      expect(fakePi.sendMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ customType: "git-commit-stopped" }),
+        expect.objectContaining({ deliverAs: "steer" }),
+      );
+      const result = await tool.execute("call-1", { type: "FIX", message: "should fail" }, undefined, vi.fn(), {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("No commit flow");
     });
   });
 });
