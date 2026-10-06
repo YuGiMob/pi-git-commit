@@ -619,6 +619,40 @@ EOF`;
       const nested = `sh -c "`.repeat(5) + "ls" + `"`.repeat(5);
       expect(await isBlocked(nested)).toBe(true);
     });
+
+    it("blocks alias definitions passed with -c", async () => {
+      expect(await isBlocked("git -c alias.p=push p")).toBe(true);
+      expect(await isBlocked("git -c alias.co=checkout co main")).toBe(true);
+      expect(await isBlocked("git -c user.name=x status")).toBe(false);
+    });
+
+    it("blocks wrapper prefixes with multi-value flags", async () => {
+      expect(await isBlocked("timeout -k 5s 10s git push")).toBe(true);
+      expect(await isBlocked("timeout -k 5 10 git push")).toBe(true);
+      expect(await isBlocked("timeout 5s 10s git push")).toBe(true);
+      expect(await isBlocked("ionice -c2 -n7 git push")).toBe(true);
+      expect(await isBlocked("nice -n 5 -v git push")).toBe(true);
+    });
+
+    it("blocks git behind additional wrapper prefixes", async () => {
+      expect(await isBlocked("setsid git push")).toBe(true);
+      expect(await isBlocked("strace -f git commit -m x")).toBe(true);
+      expect(await isBlocked("systemd-run --user git push")).toBe(true);
+      expect(await isBlocked("setsid ls -la")).toBe(false);
+    });
+
+    it("blocks object plumbing subcommands", async () => {
+      expect(await isBlocked("git hash-object -w file.txt")).toBe(true);
+      expect(await isBlocked("git hash-object file.txt")).toBe(false);
+      expect(await isBlocked("git commit-tree HEAD^{tree}")).toBe(true);
+      expect(await isBlocked("git mktree")).toBe(true);
+      expect(await isBlocked("git index-pack pack.pack")).toBe(true);
+      expect(await isBlocked("git pack-objects pack")).toBe(true);
+      expect(await isBlocked("git unpack-objects < pack.pack")).toBe(true);
+      expect(await isBlocked("git send-pack origin main")).toBe(true);
+      expect(await isBlocked("git bundle create out.bundle HEAD")).toBe(true);
+      expect(await isBlocked("git bundle verify out.bundle")).toBe(false);
+    });
   });
 
   describe("git_commit tool registration", () => {
@@ -676,6 +710,31 @@ EOF`;
     });
   });
 
+  describe("/toggle-allow-git command handler", () => {
+    const toggleCommand = () => capturedCommands.find((c: any) => c.name === "toggle-allow-git");
+    const createToggleCtx = () => ({ hasUI: true, ui: { notify: vi.fn() } });
+
+    it("allows mutative git in bash after toggling", async () => {
+      const ctx = createToggleCtx();
+      await toggleCommand()!.cmd.handler("", ctx);
+      expect(await isBlocked("git push")).toBe(false);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("allowed"), "warning");
+    });
+
+    it("blocks mutative git again on the next toggle", async () => {
+      await toggleCommand()!.cmd.handler("", createToggleCtx());
+      await toggleCommand()!.cmd.handler("", createToggleCtx());
+      expect(await isBlocked("git push")).toBe(true);
+    });
+
+    it("requires interactive mode", async () => {
+      const ctx = { hasUI: false, ui: { notify: vi.fn() } };
+      await toggleCommand()!.cmd.handler("", ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("interactive"), "error");
+      expect(await isBlocked("git push")).toBe(true);
+    });
+  });
+
   describe("/stop-commit command registration", () => {
     it("registers a command named stop-commit", () => {
       const cmd = capturedCommands.find((c: any) => c.name === "stop-commit");
@@ -688,6 +747,16 @@ EOF`;
       pi.getActiveTools = vi.fn(() => ["git_commit", "bash"]);
       sessionStartHandler!();
       expect(pi.setActiveTools).not.toHaveBeenCalled();
+    });
+
+    it("re-arms the git guard when a new session starts", async () => {
+      const toggle = capturedCommands.find((c: any) => c.name === "toggle-allow-git");
+      await toggle.cmd.handler("", { hasUI: true, ui: { notify: vi.fn() } });
+      expect(await isBlocked("git push")).toBe(false);
+
+      sessionStartHandler!();
+
+      expect(await isBlocked("git push")).toBe(true);
     });
   });
 
@@ -756,6 +825,7 @@ EOF`;
       expect(sent.details.diff).toBeUndefined();
       expect(sent.details.note).toContain("[Diff omitted:");
       expect(sent.details.stat).toContain("[Stat truncated:");
+      expect(sent.details.stat).toContain("150 files changed, 2500 insertions(+)");
     });
 
     it("includes the full diff when it fits the preview budget", async () => {
@@ -772,6 +842,22 @@ EOF`;
       expect(sent.content).not.toContain("[Diff omitted");
       expect(sent.content).toContain("+line 1996");
       expect(sent.details.diff).toBe(fittingDiff);
+    });
+
+    it("uses a fence longer than any backtick run in the diff", async () => {
+      const trickyDiff = ["diff --git a/x b/x", "--- a/x", "+++ b/x", "+```", "+hello"].join("\n");
+      pi.exec = vi.fn()
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: trickyDiff, stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: " 1 file changed, 1 insertion(+)", stderr: "" });
+      const ctx = createCtx();
+
+      await commitCommand()!.cmd.handler("", ctx);
+
+      const sent = pi.sendMessage.mock.calls[0][0] as { content: string };
+      expect(sent.content).toContain("````diff");
+      expect(sent.content).toContain("+```");
+      expect(sent.content).toContain("````");
     });
 
     it("sends the custom message without changing the active tools", async () => {
@@ -815,6 +901,43 @@ EOF`;
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Nothing to commit"), "warning");
       expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith();
+    });
+
+    it("skips staging when the flow starts with --staged", async () => {
+      pi.exec = vi.fn()
+        .mockResolvedValueOnce({ code: 0, stdout: "diff --git a/x b/x\n+staged", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "1 file changed", stderr: "" });
+      const ctx = createCtx();
+
+      await commitCommand()!.cmd.handler("--staged", ctx);
+
+      expect(pi.exec).toHaveBeenCalledTimes(2);
+      expect(pi.exec.mock.calls[0][1]).toEqual(["diff", "--staged"]);
+      expect(pi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-diff" }),
+        expect.anything(),
+      );
+    });
+
+    it("rejects unsupported arguments without opening the flow", async () => {
+      const ctx = createCtx();
+
+      await commitCommand()!.cmd.handler("--patch", ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Unsupported argument"), "error");
+      expect(pi.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it("refuses a second flow while one is active", async () => {
+      pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+      const ctx = createCtx();
+      await commitCommand()!.cmd.handler("", ctx);
+
+      const second = createCtx();
+      await commitCommand()!.cmd.handler("", second);
+
+      expect(second.ui.notify).toHaveBeenCalledWith(expect.stringContaining("already in progress"), "warning");
+      expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1070,6 +1193,33 @@ EOF`;
       await stopCommand.handler("", stopCtx);
       expect(stopCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("No commit flow"), "info");
     });
+
+    it("rejects /amend while a commit flow is active", async () => {
+      fakePi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff --git a/x b/x", stderr: "" });
+      await commitCommand.handler("", createCtx());
+      const ctx = createCtx();
+
+      await amendCommand.handler("better message", ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("already in progress"), "warning");
+      expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-amend-request" }),
+        expect.anything(),
+      );
+    });
+
+    it("rejects /commit while an amend flow is active", async () => {
+      await amendCommand.handler("better message", createCtx());
+      const ctx = createCtx();
+
+      await commitCommand.handler("", ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("already in progress"), "warning");
+      expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ customType: "git-commit-diff" }),
+        expect.anything(),
+      );
+    });
   });
 
   describe("git_amend tool integration (real git)", () => {
@@ -1276,6 +1426,17 @@ EOF`;
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("No amend flow");
     });
+
+    it("rejects a second /amend while the flow is active", async () => {
+      seedCommit("k2.txt", "seed");
+      await startAmendFlow("first critique");
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
+
+      await amendCommand.handler("second critique", ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("already in progress"), "warning");
+      expect(fakePi.sendMessage).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("git_commit tool integration (real git)", () => {
@@ -1290,9 +1451,9 @@ EOF`;
       return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
     };
 
-    const startCommitFlow = async () => {
+    const startCommitFlow = async (args = "") => {
       const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn((handler: (data: string) => unknown) => { terminalInputHandler = handler; return () => { terminalInputHandler = undefined; }; }) }, waitForIdle: vi.fn() };
-      await commitCommand.handler("", ctx);
+      await commitCommand.handler(args, ctx);
     };
 
     beforeEach(async () => {
@@ -1469,6 +1630,20 @@ EOF`;
       const result = await tool.execute("call-1", { type: "FIX", message: "should fail" }, undefined, vi.fn(), {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("No commit flow");
+    });
+
+    it("commits only the staged index when the flow starts with --staged", async () => {
+      fs.writeFileSync(path.join(tempDir, "staged.txt"), "hello");
+      fs.writeFileSync(path.join(tempDir, "unstaged.txt"), "hello");
+      runGit(["add", "staged.txt"]);
+      await startCommitFlow("--staged");
+
+      const result = await tool.execute("call-1", { type: "NEW", message: "add staged file" }, undefined, vi.fn(), {});
+
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("NEW: add staged file");
+      expect(runGit(["show", "--name-only", "--format=", "HEAD"]).stdout.trim()).toBe("staged.txt");
+      expect(runGit(["status", "--porcelain"]).stdout.trim()).toContain("?? unstaged.txt");
     });
   });
 });

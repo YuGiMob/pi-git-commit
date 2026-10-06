@@ -15,8 +15,9 @@ export default function (pi: ExtensionAPI) {
   let commitFlowActive = false;
   let amendFlowActive = false;
   let stopInputListener: (() => void) | undefined;
+  let commitStagedOnly = false;
 
-  const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec"]);
+  const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec", "setsid", "ionice", "strace", "ltrace", "flock", "unshare", "nsenter", "setpriv", "fakeroot", "busybox", "stdbuf", "watch", "run0", "systemd-run"]);
   const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
 
   const GIT_META_OPTS = new Set(["--help", "-h", "--version"]);
@@ -57,6 +58,17 @@ export default function (pi: ExtensionAPI) {
     "checkout-index": blockAll,
     "merge-file": blockAll,
     "prune-packed": blockAll,
+    "hash-object": (args) => hasShortFlag(args, "w"),
+    "commit-tree": blockAll,
+    mktree: blockAll,
+    "index-pack": blockAll,
+    "pack-objects": blockAll,
+    "unpack-objects": blockAll,
+    "send-pack": blockAll,
+    bundle: (args) => !hasAny(args, ["verify", "list-heads"]),
+    p4: blockAll,
+    svn: blockAll,
+    instaweb: blockAll,
     gc: blockAll,
     maintenance: blockAll,
     "filter-branch": blockAll,
@@ -141,28 +153,37 @@ export default function (pi: ExtensionAPI) {
     return rest;
   };
 
+  const stripDurations = (value: string): string => {
+    let rest = value;
+    for (;;) {
+      const match = rest.match(/^\d+(?:\.\d+)?[a-z]*\s+/);
+      if (!match) return rest;
+      rest = rest.slice(match[0].length).trimStart();
+    }
+  };
+
   const stripPrefixes = (segment: string): string => {
     let rest = segment;
     for (;;) {
       rest = stripEnvAssignments(rest);
       if (!rest) break;
-      const match = rest.match(/^([A-Za-z_][A-Za-z0-9_]*)\b(?:\s|$)/);
+      const match = rest.match(/^([A-Za-z_][A-Za-z0-9_-]*)(?:\s|$)/);
       if (!match) break;
       const word = match[1].toLowerCase();
       if (!PREFIXES.has(word) && !CONTROL_KEYWORDS.has(word)) break;
-      rest = rest.slice(match[0].length).trimStart();
+      rest = stripDurations(rest.slice(match[0].length).trimStart());
       if (!rest) break;
-      rest = rest.replace(/^\d+(?:\.\d+)?[a-z]*\s+/, "");
       while (rest.startsWith("-")) {
         const flag = rest.match(/^(\S+)(?:\s|$)/);
         if (!flag) break;
-        rest = rest.slice(flag[0].length).trimStart();
+        rest = stripDurations(rest.slice(flag[0].length).trimStart());
         if (!rest) break;
+        if (rest.startsWith("-")) continue;
         const next = rest.match(/^([^\s-][^\s]*)(?:\s|$)/);
         if (!next) break;
         const nextWord = next[1].toLowerCase();
         if (nextWord === "git" || nextWord === "git.exe" || PREFIXES.has(nextWord) || CONTROL_KEYWORDS.has(nextWord)) break;
-        rest = rest.slice(next[0].length).trimStart();
+        rest = stripDurations(rest.slice(next[0].length).trimStart());
       }
     }
     return rest;
@@ -178,6 +199,8 @@ export default function (pi: ExtensionAPI) {
       if (GIT_META_OPTS.has(token)) return false;
       if (GIT_OPTS_BARE.has(token)) continue;
       if (GIT_OPTS_WITH_ARG.has(token)) {
+        const value = tokens[i + 1];
+        if (value !== undefined && value.startsWith("alias.")) return true;
         i++;
         continue;
       }
@@ -236,15 +259,24 @@ export default function (pi: ExtensionAPI) {
   };
 
   const toolError = (text: string) => ({ content: [{ type: "text" as const, text }], details: {}, isError: true });
+  const execOptions = (signal: AbortSignal | undefined) => (signal === undefined ? {} : { signal });
 
   const capStat = (stat: string): string => {
     const capped = truncateHead(stat, { maxLines: STAT_PREVIEW_LINES, maxBytes: STAT_PREVIEW_BYTES });
     if (!capped.truncated) return stat;
-    return `${capped.content}\n\n[Stat truncated: showing ${capped.outputLines} of ${capped.totalLines} lines (${formatSize(capped.totalBytes)} total).]`;
+    const lines = stat.trimEnd().split("\n");
+    const summary = lines.length > capped.outputLines ? lines[lines.length - 1].trim() : "";
+    return `${capped.content}${summary ? `\n\n${summary}` : ""}\n\n[Stat truncated: showing ${capped.outputLines} of ${capped.totalLines} lines (${formatSize(capped.totalBytes)} total).]`;
   };
 
   const previewDiff = (diff: string): string | undefined =>
     truncateHead(diff, { maxLines: DIFF_PREVIEW_LINES, maxBytes: DIFF_PREVIEW_BYTES }).truncated ? undefined : diff;
+
+  const fenceFor = (text: string): string => {
+    let longest = 0;
+    for (const run of text.matchAll(/`+/g)) longest = Math.max(longest, run[0].length);
+    return "`".repeat(Math.max(3, longest + 1));
+  };
 
   const clearStopListener = () => {
     stopInputListener?.();
@@ -254,6 +286,7 @@ export default function (pi: ExtensionAPI) {
   const closeFlows = () => {
     commitFlowActive = false;
     amendFlowActive = false;
+    commitStagedOnly = false;
     clearStopListener();
   };
 
@@ -306,12 +339,14 @@ export default function (pi: ExtensionAPI) {
           return toolError("Commit message must not be empty.");
         }
         const fullMessage = `${type}: ${description}`;
-        const addResult = await pi.exec("git", ["add", "."], { signal });
-        if (addResult.code !== 0) {
-          return toolError(`Staging failed: ${addResult.stderr}`);
+        if (!commitStagedOnly) {
+          const addResult = await pi.exec("git", ["add", "."], execOptions(signal));
+          if (addResult.code !== 0) {
+            return toolError(`Staging failed: ${addResult.stderr}`);
+          }
         }
 
-        const result = await pi.exec("git", ["commit", "-m", fullMessage], { signal });
+        const result = await pi.exec("git", ["commit", "-m", fullMessage], execOptions(signal));
         if (result.code !== 0) {
           return toolError(`Commit failed: ${result.stderr}`);
         }
@@ -357,11 +392,11 @@ export default function (pi: ExtensionAPI) {
           return toolError("Commit message must not be empty.");
         }
         const fullMessage = `${type}: ${description}`;
-        const stagedResult = await pi.exec("git", ["diff", "--cached", "--quiet"], { signal });
+        const stagedResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOptions(signal));
         if (stagedResult.code !== 0) {
           return toolError("The index has staged changes. Amending would fold them into the last commit. Unstage them first or use /commit.");
         }
-        const result = await pi.exec("git", ["commit", "--amend", "-m", fullMessage, "--date=now"], { signal });
+        const result = await pi.exec("git", ["commit", "--amend", "-m", fullMessage, "--date=now"], execOptions(signal));
         if (result.code !== 0) {
           return toolError(`Amend failed: ${result.stderr}`);
         }
@@ -404,13 +439,25 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("commit", {
-    description: "Stage files and show diff for commit",
-    handler: async (_args, ctx) => {
+    description: "Stage files and show a diff for the agent to commit (--staged commits only the index)",
+    handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("commit requires interactive mode", "error");
         return;
       }
+      const request = args.trim().split(/\s+/).filter(Boolean);
+      const stagedOnly = request.includes("--staged");
+      const unsupported = request.filter((arg) => arg !== "--staged");
+      if (unsupported.length > 0) {
+        ctx.ui.notify(`Unsupported argument: ${unsupported[0]}. Usage: /commit [--staged]`, "error");
+        return;
+      }
+      if (commitFlowActive || amendFlowActive) {
+        ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
+        return;
+      }
       commitFlowActive = true;
+      commitStagedOnly = stagedOnly;
       watchForEscape(ctx);
 
       const execGit = async (label: string, args: string[]) => {
@@ -428,9 +475,11 @@ export default function (pi: ExtensionAPI) {
         await ctx.waitForIdle();
         if (!commitFlowActive) return;
 
-        await ctx.ui.setWorkingMessage("Staging files...");
-        const addResult = await execGit("git add", ["add", "."]);
-        if (!addResult || !commitFlowActive) return;
+        if (!stagedOnly) {
+          await ctx.ui.setWorkingMessage("Staging files...");
+          const addResult = await execGit("git add", ["add", "."]);
+          if (!addResult || !commitFlowActive) return;
+        }
 
         await ctx.ui.setWorkingMessage("Getting diff...");
         const diffResult = await execGit("git diff", ["diff", "--staged"]);
@@ -445,9 +494,11 @@ export default function (pi: ExtensionAPI) {
         if (!commitFlowActive) return;
         const stat = statResult.code === 0 ? capStat(statResult.stdout.trim()) : "";
         const diff = previewDiff(diffResult.stdout);
-        const diffSection = diff === undefined ? DIFF_OMITTED_NOTE : `\`\`\`diff\n${diff}\n\`\`\``;
+        const diffFence = fenceFor(diff ?? "");
+        const diffSection = diff === undefined ? DIFF_OMITTED_NOTE : `${diffFence}diff\n${diff}\n${diffFence}`;
 
-        const prompt = `DO NOT use bash to stage or commit. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\n\`\`\`\n${stat}\n\`\`\`\n\n${diffSection}\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
+        const statFence = fenceFor(stat);
+        const prompt = `DO NOT use bash to stage or commit. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\n${statFence}\n${stat}\n${statFence}\n\n${diffSection}\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
         if (!commitFlowActive) return;
         pi.sendMessage(
           { customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details: diff === undefined ? { stat, note: DIFF_OMITTED_NOTE } : { diff, stat } },
@@ -483,6 +534,10 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("amend requires interactive mode", "error");
+        return;
+      }
+      if (commitFlowActive || amendFlowActive) {
+        ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
         return;
       }
       const critique = args.trim();
