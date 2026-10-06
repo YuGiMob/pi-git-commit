@@ -1169,6 +1169,27 @@ EOF`;
       expect(again.content[0].text).toContain("No amend flow");
     });
 
+    it("refreshes the commit timestamp to the current time", async () => {
+      const oldDate = "2001-01-01T00:00:00Z";
+      fs.writeFileSync(path.join(tempDir, "k.txt"), "hello");
+      runGit(["add", "."]);
+      spawnSync("git", ["commit", "-m", "seed"], { cwd: tempDir, encoding: "utf-8", env: { ...process.env, GIT_AUTHOR_DATE: oldDate, GIT_COMMITTER_DATE: oldDate } });
+      expect(runGit(["log", "-1", "--format=%ad", "--date=unix"]).stdout.trim()).toBe("978307200");
+
+      await startAmendFlow("refresh the timestamp");
+      const before = Math.floor(Date.now() / 1000);
+      const result = await tool.execute("call-1", { type: "FIX", message: "refreshed message" }, undefined, vi.fn(), {});
+      const after = Math.ceil(Date.now() / 1000);
+
+      expect(result.isError).toBeFalsy();
+      const authorDate = Number(runGit(["log", "-1", "--format=%ad", "--date=unix"]).stdout.trim());
+      const committerDate = Number(runGit(["log", "-1", "--format=%cd", "--date=unix"]).stdout.trim());
+      expect(authorDate).toBeGreaterThanOrEqual(before);
+      expect(authorDate).toBeLessThanOrEqual(after);
+      expect(committerDate).toBeGreaterThanOrEqual(before);
+      expect(committerDate).toBeLessThanOrEqual(after);
+    });
+
     it("leaves untracked files untouched while amending", async () => {
       seedCommit("c.txt", "seed");
       await startAmendFlow("better message");
