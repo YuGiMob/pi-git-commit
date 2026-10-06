@@ -1,5 +1,5 @@
 import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { Box, matchesKey, Text } from "@earendil-works/pi-tui";
+import { Box, matchesKey, MouseRegion, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
@@ -422,20 +422,30 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
     const details = message.details as { diff?: string; stat?: string; note?: string } | undefined;
     const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
-    box.addChild(new Text(theme.fg("accent", "Staged changes"), 0, 0));
-    if (expanded) {
-      if (details?.diff) {
-        box.addChild(new Text(renderDiff(details.diff), 0, 0));
-      } else if (details?.note) {
-        box.addChild(new Text(theme.fg("dim", details.note), 0, 0));
+    let clickExpanded = expanded;
+    const populate = () => {
+      box.clear();
+      box.addChild(new Text(theme.fg("accent", "Staged changes"), 0, 0));
+      if (clickExpanded) {
+        if (details?.diff) {
+          box.addChild(new Text(renderDiff(details.diff), 0, 0));
+        } else if (details?.note) {
+          box.addChild(new Text(theme.fg("dim", details.note), 0, 0));
+        }
+      } else {
+        if (details?.stat) {
+          box.addChild(new Text(details.stat, 0, 0));
+        }
+        box.addChild(new Text(theme.fg("dim", `(${keyHint("app.tools.expand", "to expand")})`), 0, 0));
       }
-    } else {
-      if (details?.stat) {
-        box.addChild(new Text(details.stat, 0, 0));
-      }
-      box.addChild(new Text(theme.fg("dim", `(${keyHint("app.tools.expand", "to expand")})`), 0, 0));
-    }
-    return box;
+    };
+    populate();
+    return new MouseRegion(box, (event) => {
+      if (event.type !== "click" || event.button !== "left") return undefined;
+      clickExpanded = !clickExpanded;
+      populate();
+      return { handled: true };
+    });
   });
 
   pi.registerCommand("commit", {

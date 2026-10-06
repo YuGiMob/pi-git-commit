@@ -970,6 +970,28 @@ EOF`;
       expect(text).toContain("+hello");
     });
 
+    it("expands and collapses when clicked", () => {
+      const region = capturedMessageRenderer(message, { expanded: false, outputPad: 0 }, theme);
+      const click = { type: "click", button: "left", x: 0, y: 0, screenX: 0, screenY: 0, width: 80, height: 5, shift: false, alt: false, ctrl: false };
+      expect(region.render(80).join("\n")).not.toContain("diff --git");
+
+      expect(region.handleMouse(click)?.handled).toBe(true);
+      expect(region.render(80).join("\n")).toContain("diff --git");
+
+      region.handleMouse(click);
+      expect(region.render(80).join("\n")).not.toContain("diff --git");
+      expect(region.render(80).join("\n")).toContain("app.tools.expand");
+    });
+
+    it("ignores non-click mouse events", () => {
+      const region = capturedMessageRenderer(message, { expanded: false, outputPad: 0 }, theme);
+      const click = { type: "click", button: "left", x: 0, y: 0, screenX: 0, screenY: 0, width: 80, height: 5, shift: false, alt: false, ctrl: false };
+
+      expect(region.handleMouse({ ...click, type: "move" })).toBeUndefined();
+      expect(region.handleMouse({ ...click, button: "right" })).toBeUndefined();
+      expect(region.render(80).join("\n")).not.toContain("diff --git");
+    });
+
     it("shows the omission note when the diff was too large to attach", () => {
       const box = capturedMessageRenderer(
         { content: "Review staged changes", details: { stat: "1 file changed", note: "[Diff omitted: over budget]" } },
