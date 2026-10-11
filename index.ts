@@ -4,7 +4,8 @@ import { Type } from "typebox";
 
 const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
 const DIFF_CUSTOM_TYPE = "git-commit-diff";
-const CHECKPOINT_CUSTOM_TYPE = "git-commit-checkpoint";
+const CHECKPOINT_MARKER_PREFIX = "[pi-git-commit checkpoint #";
+const CHECKPOINT_MARKER_RE = /^\[pi-git-commit checkpoint #(\d+)\]$/;
 const DIFF_PREVIEW_LINES = 2000;
 const DIFF_PREVIEW_BYTES = 50 * 1024;
 const STAT_PREVIEW_LINES = 100;
@@ -17,8 +18,8 @@ export default function (pi: ExtensionAPI) {
   let amendFlowActive = false;
   let stopInputListener: (() => void) | undefined;
   let commitStagedOnly = false;
-  let queuedCommitCount = 0;
-  let commitGeneration = 0;
+  const queuedCommits = new Map<number, { stagedOnly: boolean }>();
+  let nextCommitId = 0;
 
   const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec", "setsid", "ionice", "strace", "ltrace", "flock", "unshare", "nsenter", "setpriv", "fakeroot", "busybox", "stdbuf", "watch", "run0", "systemd-run"]);
   const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
@@ -292,6 +293,20 @@ export default function (pi: ExtensionAPI) {
     return { prompt, details };
   };
 
+  const messageText = (content: unknown): string => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.map((part) => {
+      const candidate = part as { type?: string; text?: string };
+      return candidate.type === "text" && typeof candidate.text === "string" ? candidate.text : "";
+    }).join("");
+  };
+
+  const checkpointIdFrom = (content: unknown): number | undefined => {
+    const match = CHECKPOINT_MARKER_RE.exec(messageText(content).trim());
+    return match ? Number(match[1]) : undefined;
+  };
+
   const clearStopListener = () => {
     stopInputListener?.();
     stopInputListener = undefined;
@@ -305,8 +320,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const cancelQueuedCommits = () => {
-    queuedCommitCount = 0;
-    commitGeneration += 1;
+    queuedCommits.clear();
   };
 
   const sendFlowStopped = (stoppedBy: string) => {
@@ -319,7 +333,7 @@ export default function (pi: ExtensionAPI) {
   const watchForEscape = (ctx: ExtensionContext) => {
     clearStopListener();
     stopInputListener = ctx.ui.onTerminalInput((data) => {
-      if (!commitFlowActive && !amendFlowActive && queuedCommitCount === 0) return undefined;
+      if (!commitFlowActive && !amendFlowActive && queuedCommits.size === 0) return undefined;
       if (!matchesKey(data, "escape")) return undefined;
       const flowName = amendFlowActive ? "Amend" : "Commit";
       closeFlows();
@@ -434,44 +448,49 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("message_end", async (event, ctx) => {
+  pi.on("message_start", async (event, ctx) => {
     const message = event.message;
-    if (message.role !== "custom" || message.customType !== CHECKPOINT_CUSTOM_TYPE) return;
-    const checkpoint = message.details as { generation?: number; stagedOnly?: boolean } | undefined;
-    if (checkpoint?.generation !== commitGeneration) {
-      return { message: { ...message, content: "A queued commit checkpoint was cancelled.", display: false } };
+    if (message.role !== "user") return;
+    const id = checkpointIdFrom(message.content);
+    if (id === undefined) return;
+    const pending = queuedCommits.get(id);
+    if (!pending) {
+      Object.assign(message, { role: "custom", customType: DIFF_CUSTOM_TYPE, content: "A queued commit checkpoint was cancelled.", display: false });
+      return;
     }
-    queuedCommitCount = Math.max(0, queuedCommitCount - 1);
-    const stagedOnly = checkpoint?.stagedOnly === true;
+    queuedCommits.delete(id);
 
-    if (!stagedOnly) {
+    if (!pending.stagedOnly) {
       const addResult = await pi.exec("git", ["add", "."], execOptions(ctx.signal));
       if (addResult.code !== 0) {
         ctx.ui.notify(`git add failed: ${addResult.stderr}`, "error");
-        return { message: { ...message, content: `Commit checkpoint skipped: git add failed. ${addResult.stderr}`, display: false } };
+        Object.assign(message, { role: "custom", customType: DIFF_CUSTOM_TYPE, content: `Commit checkpoint skipped: git add failed. ${addResult.stderr}`, display: false });
+        return;
       }
     }
 
     const diffResult = await pi.exec("git", ["diff", "--staged"], execOptions(ctx.signal));
     if (diffResult.code !== 0) {
       ctx.ui.notify(`git diff failed: ${diffResult.stderr}`, "error");
-      return { message: { ...message, content: `Commit checkpoint skipped: git diff failed. ${diffResult.stderr}`, display: false } };
+      Object.assign(message, { role: "custom", customType: DIFF_CUSTOM_TYPE, content: `Commit checkpoint skipped: git diff failed. ${diffResult.stderr}`, display: false });
+      return;
     }
     if (!diffResult.stdout.trim()) {
       ctx.ui.notify("Nothing to commit (empty diff). Stage files first.", "warning");
-      return { message: { ...message, content: "Commit checkpoint skipped: nothing staged.", display: false } };
+      Object.assign(message, { role: "custom", customType: DIFF_CUSTOM_TYPE, content: "Commit checkpoint skipped: nothing staged.", display: false });
+      return;
     }
 
     const statResult = await pi.exec("git", ["diff", "--staged", "--stat"], execOptions(ctx.signal));
     const { prompt, details } = buildReview(diffResult.stdout, statResult.code === 0 ? statResult.stdout.trim() : "");
     commitFlowActive = true;
-    commitStagedOnly = stagedOnly;
+    commitStagedOnly = pending.stagedOnly;
     watchForEscape(ctx);
-    return { message: { ...message, customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details } };
+    Object.assign(message, { role: "custom", customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details });
   });
 
   pi.on("agent_before_settle", () => {
-    if (queuedCommitCount > 0) cancelQueuedCommits();
+    if (queuedCommits.size > 0) cancelQueuedCommits();
   });
 
   pi.on("session_start", () => {
@@ -528,13 +547,12 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("An amend flow is already in progress. Run /stop-commit first.", "warning");
           return;
         }
-        queuedCommitCount += 1;
-        pi.sendMessage(
-          { customType: CHECKPOINT_CUSTOM_TYPE, content: "Commit checkpoint", display: false, details: { generation: commitGeneration, stagedOnly } },
-          { deliverAs: "followUp" },
-        );
+        const id = nextCommitId;
+        nextCommitId += 1;
+        queuedCommits.set(id, { stagedOnly });
+        pi.sendUserMessage(`${CHECKPOINT_MARKER_PREFIX}${id}]`, { deliverAs: "followUp" });
         watchForEscape(ctx);
-        ctx.ui.notify(`Commit checkpoint queued (${queuedCommitCount} waiting). It runs when the queued work ahead of it finishes.`, "info");
+        ctx.ui.notify(`Commit checkpoint queued (${queuedCommits.size} waiting). It runs when the queued work ahead of it finishes.`, "info");
         return;
       }
       if (commitFlowActive || amendFlowActive) {
@@ -596,7 +614,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("stop-commit requires interactive mode", "error");
         return;
       }
-      const flowWasActive = commitFlowActive || amendFlowActive || queuedCommitCount > 0;
+      const flowWasActive = commitFlowActive || amendFlowActive || queuedCommits.size > 0;
       closeFlows();
       cancelQueuedCommits();
       if (flowWasActive) {
@@ -616,7 +634,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("amend requires interactive mode", "error");
         return;
       }
-      if (commitFlowActive || amendFlowActive || queuedCommitCount > 0) {
+      if (commitFlowActive || amendFlowActive || queuedCommits.size > 0) {
         ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
         return;
       }

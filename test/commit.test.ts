@@ -58,7 +58,7 @@ describe("commit extension", () => {
   let capturedCommands: any[];
   let toolCallHandler: ((event: any) => Promise<any>) | undefined;
   let sessionStartHandler: (() => void) | undefined;
-  let messageEndHandler: ((event: any, ctx: any) => Promise<any>) | undefined;
+  let messageStartHandler: ((event: any, ctx: any) => Promise<void>) | undefined;
   let agentBeforeSettleHandler: ((event: any) => void) | undefined;
 
   async function isBlocked(command: string, toolName = "bash"): Promise<boolean> {
@@ -73,13 +73,13 @@ describe("commit extension", () => {
     capturedMessageRenderer = undefined;
     toolCallHandler = undefined;
     sessionStartHandler = undefined;
-    messageEndHandler = undefined;
+    messageStartHandler = undefined;
     agentBeforeSettleHandler = undefined;
     pi = {
       on: vi.fn((event: string, handler: any) => {
         if (event === "tool_call") toolCallHandler = handler;
         if (event === "session_start") sessionStartHandler = handler;
-        if (event === "message_end") messageEndHandler = handler;
+        if (event === "message_start") messageStartHandler = handler;
         if (event === "agent_before_settle") agentBeforeSettleHandler = handler;
       }),
       registerTool: vi.fn((tool: any) => {
@@ -950,13 +950,7 @@ EOF`;
   describe("queued commit checkpoints", () => {
     const commitCommand = () => capturedCommands.find((c: any) => c.name === "commit");
     const stopCommand = () => capturedCommands.find((c: any) => c.name === "stop-commit");
-    const checkpoint = (details: { generation: number; stagedOnly: boolean }) => ({
-      role: "custom",
-      customType: "git-commit-checkpoint",
-      content: "Commit checkpoint",
-      display: false,
-      details,
-    });
+    const checkpoint = (id: number): any => ({ role: "user", content: [{ type: "text", text: `[pi-git-commit checkpoint #${id}]` }] });
     let terminalInputHandler: ((data: string) => unknown) | undefined;
 
     function createStreamingCtx() {
@@ -979,39 +973,34 @@ EOF`;
       };
     }
 
-    it("queues a checkpoint instead of staging while the agent is streaming", async () => {
+    it("queues a visible checkpoint at the current position while the agent is streaming", async () => {
       pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "diff", stderr: "" });
       const ctx = createStreamingCtx();
 
       await commitCommand()!.cmd.handler("", ctx);
 
       expect(pi.exec).not.toHaveBeenCalled();
-      expect(pi.sendMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          customType: "git-commit-checkpoint",
-          display: false,
-          details: { generation: 0, stagedOnly: false },
-        }),
-        expect.objectContaining({ deliverAs: "followUp" }),
-      );
+      expect(pi.sendUserMessage).toHaveBeenCalledWith("[pi-git-commit checkpoint #0]", { deliverAs: "followUp" });
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("queued"), "info");
     });
 
-    it("replaces a surfaced checkpoint with the staged review and opens the flow", async () => {
+    it("turns a surfaced checkpoint into the staged review and opens the flow", async () => {
       pi.exec = vi.fn()
         .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
         .mockResolvedValueOnce({ code: 0, stdout: "diff --git a/x b/x\n+hello", stderr: "" })
         .mockResolvedValueOnce({ code: 0, stdout: "1 file changed, 1 insertion(+)", stderr: "" });
       const ctx = createStreamingCtx();
       await commitCommand()!.cmd.handler("", ctx);
+      const message = checkpoint(0);
 
-      const result = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: false }) }, ctx);
+      await messageStartHandler!({ message }, ctx);
 
-      expect(result.message.customType).toBe("git-commit-diff");
-      expect(result.message.display).toBe(true);
-      expect(result.message.content).toContain("Review staged changes");
-      expect(result.message.content).toContain("+hello");
-      expect(result.message.details).toEqual({ diff: "diff --git a/x b/x\n+hello", stat: "1 file changed, 1 insertion(+)" });
+      expect(message.role).toBe("custom");
+      expect(message.customType).toBe("git-commit-diff");
+      expect(message.display).toBe(true);
+      expect(message.content).toContain("Review staged changes");
+      expect(message.content).toContain("+hello");
+      expect(message.details).toEqual({ diff: "diff --git a/x b/x\n+hello", stat: "1 file changed, 1 insertion(+)" });
 
       pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "", stderr: "" });
       const tool = capturedTools.find((t: any) => t.name === "git_commit");
@@ -1027,10 +1016,11 @@ EOF`;
       const ctx = createStreamingCtx();
 
       await commitCommand()!.cmd.handler("--staged", ctx);
-      const result = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: true }) }, ctx);
+      const message = checkpoint(0);
+      await messageStartHandler!({ message }, ctx);
 
       expect(pi.exec.mock.calls[0][1]).toEqual(["diff", "--staged"]);
-      expect(result.message.customType).toBe("git-commit-diff");
+      expect(message.customType).toBe("git-commit-diff");
     });
 
     it("runs multiple queued checkpoints in order", async () => {
@@ -1045,11 +1035,13 @@ EOF`;
       await commitCommand()!.cmd.handler("", ctx);
       await commitCommand()!.cmd.handler("--staged", ctx);
 
-      const first = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: false }) }, ctx);
-      const second = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: true }) }, ctx);
+      const first = checkpoint(0);
+      const second = checkpoint(1);
+      await messageStartHandler!({ message: first }, ctx);
+      await messageStartHandler!({ message: second }, ctx);
 
-      expect(first.message.details).toEqual({ diff: "first", stat: "stat first" });
-      expect(second.message.details).toEqual({ diff: "second", stat: "stat second" });
+      expect(first.details).toEqual({ diff: "first", stat: "stat first" });
+      expect(second.details).toEqual({ diff: "second", stat: "stat second" });
       expect(pi.exec.mock.calls[1][1]).toEqual(["diff", "--staged"]);
       expect(pi.exec.mock.calls[3][1]).toEqual(["diff", "--staged"]);
     });
@@ -1062,11 +1054,12 @@ EOF`;
       const stopCtx = createStreamingCtx();
       await stopCommand()!.cmd.handler("", stopCtx);
 
-      const result = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: false }) }, ctx);
+      const message = checkpoint(0);
+      await messageStartHandler!({ message }, ctx);
 
       expect(pi.exec).not.toHaveBeenCalled();
-      expect(result.message.customType).toBe("git-commit-checkpoint");
-      expect(result.message.content).toContain("cancelled");
+      expect(message.role).toBe("custom");
+      expect(message.content).toContain("cancelled");
       expect(stopCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stopped"), "info");
     });
 
@@ -1077,10 +1070,11 @@ EOF`;
 
       agentBeforeSettleHandler!({ outcome: "completed" });
 
-      const result = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: false }) }, ctx);
+      const message = checkpoint(0);
+      await messageStartHandler!({ message }, ctx);
 
       expect(pi.exec).not.toHaveBeenCalled();
-      expect(result.message.content).toContain("cancelled");
+      expect(message.content).toContain("cancelled");
     });
 
     it("cancels queued checkpoints when escape is pressed", async () => {
@@ -1092,8 +1086,9 @@ EOF`;
       terminalInputHandler!("\x1b");
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Commit flow stopped"), "info");
-      const result = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: false }) }, ctx);
-      expect(result.message.content).toContain("cancelled");
+      const message = checkpoint(0);
+      await messageStartHandler!({ message }, ctx);
+      expect(message.content).toContain("cancelled");
     });
 
     it("reports a failed checkpoint without opening the flow", async () => {
@@ -1101,10 +1096,11 @@ EOF`;
       const ctx = createStreamingCtx();
       await commitCommand()!.cmd.handler("", ctx);
 
-      const result = await messageEndHandler!({ message: checkpoint({ generation: 0, stagedOnly: false }) }, ctx);
+      const message = checkpoint(0);
+      await messageStartHandler!({ message }, ctx);
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("git add failed"), "error");
-      expect(result.message.content).toContain("git add failed");
+      expect(message.content).toContain("git add failed");
       const tool = capturedTools.find((t: any) => t.name === "git_commit");
       const refused = await tool.execute("call-1", { type: "FIX", message: "x" }, undefined, vi.fn(), {});
       expect(refused.isError).toBe(true);
@@ -1120,18 +1116,17 @@ EOF`;
       await commitCommand()!.cmd.handler("", ctx);
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("amend flow is already in progress"), "warning");
-      expect(pi.sendMessage).not.toHaveBeenCalledWith(
-        expect.objectContaining({ customType: "git-commit-checkpoint" }),
-        expect.anything(),
-      );
+      expect(pi.sendUserMessage).not.toHaveBeenCalled();
     });
 
-    it("leaves unrelated messages untouched", async () => {
+    it("leaves unrelated user messages untouched", async () => {
       const ctx = createStreamingCtx();
+      const message: any = { role: "user", content: [{ type: "text", text: "hello" }] };
 
-      const result = await messageEndHandler!({ message: { role: "assistant", content: "hi" } }, ctx);
+      await messageStartHandler!({ message }, ctx);
 
-      expect(result).toBeUndefined();
+      expect(message.role).toBe("user");
+      expect(message.content).toEqual([{ type: "text", text: "hello" }]);
     });
   });
 
@@ -1661,7 +1656,7 @@ EOF`;
     let fakePi: any;
     let commitCommand: any;
     let terminalInputHandler: ((data: string) => unknown) | undefined;
-    let messageEndHandler: any;
+    let messageStartHandler: any;
 
     const runGit = (args: string[]) => {
       const result = spawnSync("git", args, { cwd: tempDir, encoding: "utf-8" });
@@ -1684,7 +1679,7 @@ EOF`;
       const mod = await import("../index.js");
       fakePi = {
         on: vi.fn((event: string, handler: any) => {
-          if (event === "message_end") messageEndHandler = handler;
+          if (event === "message_start") messageStartHandler = handler;
         }),
         registerTool: vi.fn((registered: any) => {
           if (registered.name === "git_commit") tool = registered;
@@ -1871,10 +1866,11 @@ EOF`;
       await commitCommand.handler("", ctx);
       expect(runGit(["status", "--porcelain"]).stdout.trim()).toBe("?? queued.txt");
 
-      const result = await messageEndHandler({ message: { role: "custom", customType: "git-commit-checkpoint", content: "Commit checkpoint", display: false, details: { generation: 0, stagedOnly: false } } }, ctx);
+      const message: any = { role: "user", content: [{ type: "text", text: "[pi-git-commit checkpoint #0]" }] };
+      await messageStartHandler({ message }, ctx);
 
-      expect(result.message.customType).toBe("git-commit-diff");
-      expect(result.message.content).toContain("Review staged changes");
+      expect(message.customType).toBe("git-commit-diff");
+      expect(message.content).toContain("Review staged changes");
 
       const committed = await tool.execute("call-1", { type: "NEW", message: "add queued.txt" }, undefined, vi.fn(), {});
       expect(committed.isError).toBeFalsy();
