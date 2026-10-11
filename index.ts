@@ -1,9 +1,10 @@
-import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, matchesKey, MouseRegion, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
 const DIFF_CUSTOM_TYPE = "git-commit-diff";
+const CHECKPOINT_CUSTOM_TYPE = "git-commit-checkpoint";
 const DIFF_PREVIEW_LINES = 2000;
 const DIFF_PREVIEW_BYTES = 50 * 1024;
 const STAT_PREVIEW_LINES = 100;
@@ -16,6 +17,8 @@ export default function (pi: ExtensionAPI) {
   let amendFlowActive = false;
   let stopInputListener: (() => void) | undefined;
   let commitStagedOnly = false;
+  let queuedCommitCount = 0;
+  let commitGeneration = 0;
 
   const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec", "setsid", "ionice", "strace", "ltrace", "flock", "unshare", "nsenter", "setpriv", "fakeroot", "busybox", "stdbuf", "watch", "run0", "systemd-run"]);
   const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
@@ -278,6 +281,17 @@ export default function (pi: ExtensionAPI) {
     return "`".repeat(Math.max(3, longest + 1));
   };
 
+  const buildReview = (diffStdout: string, statStdout: string) => {
+    const stat = capStat(statStdout);
+    const diff = previewDiff(diffStdout);
+    const diffFence = fenceFor(diff ?? "");
+    const diffSection = diff === undefined ? DIFF_OMITTED_NOTE : `${diffFence}diff\n${diff}\n${diffFence}`;
+    const statFence = fenceFor(stat);
+    const prompt = `DO NOT use bash to stage or commit. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\n${statFence}\n${stat}\n${statFence}\n\n${diffSection}\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
+    const details = diff === undefined ? { stat, note: DIFF_OMITTED_NOTE } : { diff, stat };
+    return { prompt, details };
+  };
+
   const clearStopListener = () => {
     stopInputListener?.();
     stopInputListener = undefined;
@@ -290,6 +304,11 @@ export default function (pi: ExtensionAPI) {
     clearStopListener();
   };
 
+  const cancelQueuedCommits = () => {
+    queuedCommitCount = 0;
+    commitGeneration += 1;
+  };
+
   const sendFlowStopped = (stoppedBy: string) => {
     pi.sendMessage(
       { customType: "git-commit-stopped", content: `The user stopped the pending flow ${stoppedBy}. Do not attempt to commit or amend.`, display: false },
@@ -297,13 +316,14 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
-  const watchForEscape = (ctx: ExtensionCommandContext) => {
+  const watchForEscape = (ctx: ExtensionContext) => {
     clearStopListener();
     stopInputListener = ctx.ui.onTerminalInput((data) => {
-      if (!commitFlowActive && !amendFlowActive) return undefined;
+      if (!commitFlowActive && !amendFlowActive && queuedCommitCount === 0) return undefined;
       if (!matchesKey(data, "escape")) return undefined;
-      const flowName = commitFlowActive ? "Commit" : "Amend";
+      const flowName = amendFlowActive ? "Amend" : "Commit";
       closeFlows();
+      cancelQueuedCommits();
       ctx.ui.setWorkingMessage();
       sendFlowStopped("by pressing escape");
       ctx.ui.notify(`${flowName} flow stopped.`, "info");
@@ -414,9 +434,50 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.on("message_end", async (event, ctx) => {
+    const message = event.message;
+    if (message.role !== "custom" || message.customType !== CHECKPOINT_CUSTOM_TYPE) return;
+    const checkpoint = message.details as { generation?: number; stagedOnly?: boolean } | undefined;
+    if (checkpoint?.generation !== commitGeneration) {
+      return { message: { ...message, content: "A queued commit checkpoint was cancelled.", display: false } };
+    }
+    queuedCommitCount = Math.max(0, queuedCommitCount - 1);
+    const stagedOnly = checkpoint?.stagedOnly === true;
+
+    if (!stagedOnly) {
+      const addResult = await pi.exec("git", ["add", "."], execOptions(ctx.signal));
+      if (addResult.code !== 0) {
+        ctx.ui.notify(`git add failed: ${addResult.stderr}`, "error");
+        return { message: { ...message, content: `Commit checkpoint skipped: git add failed. ${addResult.stderr}`, display: false } };
+      }
+    }
+
+    const diffResult = await pi.exec("git", ["diff", "--staged"], execOptions(ctx.signal));
+    if (diffResult.code !== 0) {
+      ctx.ui.notify(`git diff failed: ${diffResult.stderr}`, "error");
+      return { message: { ...message, content: `Commit checkpoint skipped: git diff failed. ${diffResult.stderr}`, display: false } };
+    }
+    if (!diffResult.stdout.trim()) {
+      ctx.ui.notify("Nothing to commit (empty diff). Stage files first.", "warning");
+      return { message: { ...message, content: "Commit checkpoint skipped: nothing staged.", display: false } };
+    }
+
+    const statResult = await pi.exec("git", ["diff", "--staged", "--stat"], execOptions(ctx.signal));
+    const { prompt, details } = buildReview(diffResult.stdout, statResult.code === 0 ? statResult.stdout.trim() : "");
+    commitFlowActive = true;
+    commitStagedOnly = stagedOnly;
+    watchForEscape(ctx);
+    return { message: { ...message, customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details } };
+  });
+
+  pi.on("agent_before_settle", () => {
+    if (queuedCommitCount > 0) cancelQueuedCommits();
+  });
+
   pi.on("session_start", () => {
     gitBlocked = true;
     closeFlows();
+    cancelQueuedCommits();
   });
 
   pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
@@ -462,6 +523,20 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Unsupported argument: ${unsupported[0]}. Usage: /commit [--staged]`, "error");
         return;
       }
+      if (ctx.signal !== undefined) {
+        if (amendFlowActive) {
+          ctx.ui.notify("An amend flow is already in progress. Run /stop-commit first.", "warning");
+          return;
+        }
+        queuedCommitCount += 1;
+        pi.sendMessage(
+          { customType: CHECKPOINT_CUSTOM_TYPE, content: "Commit checkpoint", display: false, details: { generation: commitGeneration, stagedOnly } },
+          { deliverAs: "followUp" },
+        );
+        watchForEscape(ctx);
+        ctx.ui.notify(`Commit checkpoint queued (${queuedCommitCount} waiting). It runs when the queued work ahead of it finishes.`, "info");
+        return;
+      }
       if (commitFlowActive || amendFlowActive) {
         ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
         return;
@@ -502,16 +577,10 @@ export default function (pi: ExtensionAPI) {
 
         const statResult = await pi.exec("git", ["diff", "--staged", "--stat"]);
         if (!commitFlowActive) return;
-        const stat = statResult.code === 0 ? capStat(statResult.stdout.trim()) : "";
-        const diff = previewDiff(diffResult.stdout);
-        const diffFence = fenceFor(diff ?? "");
-        const diffSection = diff === undefined ? DIFF_OMITTED_NOTE : `${diffFence}diff\n${diff}\n${diffFence}`;
-
-        const statFence = fenceFor(stat);
-        const prompt = `DO NOT use bash to stage or commit. Use ONLY the \`git_commit\` tool.\n\nReview staged changes:\n\n${statFence}\n${stat}\n${statFence}\n\n${diffSection}\n\nUse \`git_commit\` tool with:\n- type: FIX, IMPROVE, or NEW\n- message: brief description (imperative mood)`;
+        const { prompt, details } = buildReview(diffResult.stdout, statResult.code === 0 ? statResult.stdout.trim() : "");
         if (!commitFlowActive) return;
         pi.sendMessage(
-          { customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details: diff === undefined ? { stat, note: DIFF_OMITTED_NOTE } : { diff, stat } },
+          { customType: DIFF_CUSTOM_TYPE, content: prompt, display: true, details },
           { deliverAs: "followUp", triggerTurn: true },
         );
       } finally {
@@ -527,8 +596,9 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("stop-commit requires interactive mode", "error");
         return;
       }
-      const flowWasActive = commitFlowActive || amendFlowActive;
+      const flowWasActive = commitFlowActive || amendFlowActive || queuedCommitCount > 0;
       closeFlows();
+      cancelQueuedCommits();
       if (flowWasActive) {
         ctx.ui.setWorkingMessage();
         sendFlowStopped("with /stop-commit");
@@ -546,7 +616,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("amend requires interactive mode", "error");
         return;
       }
-      if (commitFlowActive || amendFlowActive) {
+      if (commitFlowActive || amendFlowActive || queuedCommitCount > 0) {
         ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
         return;
       }
