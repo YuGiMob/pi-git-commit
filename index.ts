@@ -404,8 +404,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "git_amend",
     label: "Git Amend",
-    description: "Amend the message of the last commit and refresh its timestamp to now. Only use when the user has run /amend and asked you to amend. Do not call this tool unprompted.",
-    promptSnippet: "Amend the last commit message and timestamp (only after user runs /amend)",
+    description: "Stage all changes and amend the last commit with the corrected message, refreshing its timestamp to now. Only use when the user has run /amend and asked you to amend. Do not call this tool unprompted.",
+    promptSnippet: "Stage all changes and amend the last commit (only after user runs /amend)",
     promptGuidelines: [
       "Only use git_amend when the user explicitly asks you to amend after they ran /amend",
       "Do not call git_amend on its own — wait for the user to run /amend first",
@@ -430,9 +430,9 @@ export default function (pi: ExtensionAPI) {
           return toolError("Commit message must not be empty.");
         }
         const fullMessage = `${type}: ${description}`;
-        const stagedResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOptions(signal));
-        if (stagedResult.code !== 0) {
-          return toolError("The index has staged changes. Amending would fold them into the last commit. Unstage them first or use /commit.");
+        const addResult = await pi.exec("git", ["add", "."], execOptions(signal));
+        if (addResult.code !== 0) {
+          return toolError(`Staging failed: ${addResult.stderr}`);
         }
         const result = await pi.exec("git", ["commit", "--amend", "-m", fullMessage, "--date=now"], execOptions(signal));
         if (result.code !== 0) {
@@ -637,7 +637,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("amend", {
-    description: "Send your critique of the last commit message to the agent for git_amend (refreshes the commit timestamp)",
+    description: "Send your critique of the last commit message to the agent for git_amend (stages all changes and refreshes the commit timestamp)",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("amend requires interactive mode", "error");
@@ -660,7 +660,7 @@ export default function (pi: ExtensionAPI) {
         await ctx.waitForIdle();
         if (!amendFlowActive) return;
 
-        const prompt = `DO NOT use bash for git. Use ONLY the \`git_amend\` tool.\n\nThe user wants the last commit message changed.\n\nUser critique: ${critique}\n\nChoose the right type (FIX, IMPROVE, or NEW), write a corrected message that answers the critique, and call \`git_amend\` with it. Do not change the committed content. The tool also refreshes the commit timestamp to now.`;
+        const prompt = `DO NOT use bash for git. Use ONLY the \`git_amend\` tool.\n\nThe user wants the last commit amended.\n\nUser critique: ${critique}\n\nChoose the right type (FIX, IMPROVE, or NEW), write a corrected message that answers the critique, and call \`git_amend\` with it. The tool stages all changes and folds them into the last commit, and refreshes the commit timestamp to now.`;
         pi.sendMessage(
           { customType: "git-amend-request", content: prompt, display: false },
           { deliverAs: "followUp", triggerTurn: true },

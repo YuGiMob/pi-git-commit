@@ -1575,32 +1575,50 @@ EOF`;
       expect(committerDate).toBeLessThanOrEqual(after);
     });
 
-    it("leaves untracked files untouched while amending", async () => {
+    it("stages all changes and folds them into the amended commit", async () => {
       seedCommit("c.txt", "seed");
       await startAmendFlow("better message");
+      fs.writeFileSync(path.join(tempDir, "c.txt"), "changed");
       fs.writeFileSync(path.join(tempDir, "d.txt"), "untracked");
 
       const result = await tool.execute("call-1", { type: "IMPROVE", message: "better message" }, undefined, vi.fn(), {});
+
       expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("IMPROVE: better message");
-      expect(runGit(["status", "--porcelain"]).stdout.trim()).toBe("?? d.txt");
+      expect(runGit(["status", "--porcelain"]).stdout.trim()).toBe("");
+      expect(runGit(["show", "--name-only", "--format=", "HEAD"]).stdout).toContain("c.txt");
+      expect(runGit(["show", "--name-only", "--format=", "HEAD"]).stdout).toContain("d.txt");
     });
 
-    it("refuses when the index has staged changes and keeps the flow open", async () => {
+    it("reports a staging failure and keeps the flow open", async () => {
+      seedCommit("c2.txt", "seed");
+      await startAmendFlow("fix");
+      fakePi.exec = vi.fn(async (_command: string, args: string[]) => {
+        if (args[0] === "add") return { code: 1, stdout: "", stderr: "add boom" };
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      const failed = await tool.execute("call-1", { type: "FIX", message: "boom" }, undefined, vi.fn(), {});
+      expect(failed.isError).toBe(true);
+      expect(failed.content[0].text).toContain("Staging failed");
+
+      fakePi.exec = realExec;
+      const retry = await tool.execute("call-1", { type: "FIX", message: "real message" }, undefined, vi.fn(), {});
+      expect(retry.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: real message");
+    });
+
+    it("folds staged changes into the amended commit", async () => {
       seedCommit("e.txt", "seed");
       await startAmendFlow("sharpen the message");
       fs.writeFileSync(path.join(tempDir, "f.txt"), "staged");
       runGit(["add", "."]);
 
       const result = await tool.execute("call-1", { type: "FIX", message: "sharpened" }, undefined, vi.fn(), {});
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("staged");
-      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("seed");
 
-      runGit(["reset"]);
-      const retry = await tool.execute("call-1", { type: "FIX", message: "sharpened" }, undefined, vi.fn(), {});
-      expect(retry.isError).toBeFalsy();
+      expect(result.isError).toBeFalsy();
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: sharpened");
+      expect(runGit(["status", "--porcelain"]).stdout.trim()).toBe("");
+      expect(runGit(["show", "--name-only", "--format=", "HEAD"]).stdout).toContain("f.txt");
     });
 
     it("keeps the flow open after a failed amend so the agent can retry", async () => {
