@@ -1204,13 +1204,14 @@ EOF`;
       expect(region.render(80).join("\n")).not.toContain("diff --git");
     });
 
-    it("shows the omission note when the diff was too large to attach", () => {
+    it("shows the stat and omission note when the diff was too large to attach", () => {
       const box = capturedMessageRenderer(
         { content: "Review staged changes", details: { stat: "1 file changed", note: "[Diff omitted: over budget]" } },
         { expanded: true, outputPad: 0 },
         theme,
       );
       const text = box.render(80).join("\n");
+      expect(text).toContain("1 file changed");
       expect(text).toContain("[Diff omitted: over budget]");
     });
   });

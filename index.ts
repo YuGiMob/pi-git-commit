@@ -513,8 +513,13 @@ export default function (pi: ExtensionAPI) {
       if (clickExpanded) {
         if (details?.diff) {
           box.addChild(new Text(renderDiff(details.diff), 0, 0));
-        } else if (details?.note) {
-          box.addChild(new Text(theme.fg("dim", details.note), 0, 0));
+        } else {
+          if (details?.stat) {
+            box.addChild(new Text(details.stat, 0, 0));
+          }
+          if (details?.note) {
+            box.addChild(new Text(theme.fg("dim", details.note), 0, 0));
+          }
         }
       } else {
         if (details?.stat) {
