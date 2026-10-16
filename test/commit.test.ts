@@ -695,6 +695,29 @@ EOF`;
     });
   });
 
+  describe("commit tool call rendering", () => {
+    const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
+
+    it("shows the tool name and type without the message argument", () => {
+      for (const name of ["git_commit", "git_amend"]) {
+        const tool = capturedTools.find((t: any) => t.name === name);
+        const rendered = tool.renderCall({ type: "NEW", message: "Add a key manager" }, theme, {}).render(80).join("\n");
+        expect(rendered).toContain(name);
+        expect(rendered).toContain("NEW");
+        expect(rendered).not.toContain("Add a key manager");
+      }
+    });
+
+    it("renders a placeholder while the arguments stream", () => {
+      for (const name of ["git_commit", "git_amend"]) {
+        const tool = capturedTools.find((t: any) => t.name === name);
+        const rendered = tool.renderCall({}, theme, {}).render(80).join("\n");
+        expect(rendered).toContain(name);
+        expect(rendered).not.toContain("undefined");
+      }
+    });
+  });
+
   describe("/amend command registration", () => {
     it("registers a command named amend", () => {
       const cmd = capturedCommands.find((c: any) => c.name === "amend");

@@ -1,8 +1,10 @@
-import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { formatSize, keyHint, renderDiff, truncateHead, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { Box, matchesKey, MouseRegion, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const COMMIT_TYPES = ["FIX", "IMPROVE", "NEW"] as const;
+const renderCommitToolCall = (name: string) => (args: { type?: string } | undefined, theme: Theme) =>
+  new Text(`${theme.fg("toolTitle", theme.bold(`${name} `))}${args?.type ? theme.fg("muted", args.type) : theme.fg("dim", "…")}`, 0, 0);
 const DIFF_CUSTOM_TYPE = "git-commit-diff";
 const CHECKPOINT_MARKER_PREFIX = "[pi-git-commit checkpoint #";
 const CHECKPOINT_MARKER_RE = /^\[pi-git-commit checkpoint #(\d+)\]$/;
@@ -354,6 +356,7 @@ export default function (pi: ExtensionAPI) {
       "Only use git_commit when the user explicitly asks you to commit after they ran /commit",
       "Do not call git_commit on its own — wait for the user to run /commit first",
     ],
+    renderCall: renderCommitToolCall("git_commit"),
     parameters: Type.Object({
       type: Type.Union(COMMIT_TYPES.map((t) => Type.Literal(t))),
       message: Type.String({
@@ -407,6 +410,7 @@ export default function (pi: ExtensionAPI) {
       "Only use git_amend when the user explicitly asks you to amend after they ran /amend",
       "Do not call git_amend on its own — wait for the user to run /amend first",
     ],
+    renderCall: renderCommitToolCall("git_amend"),
     parameters: Type.Object({
       type: Type.Union(COMMIT_TYPES.map((t) => Type.Literal(t))),
       message: Type.String({
