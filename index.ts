@@ -8,6 +8,10 @@ const renderCommitToolCall = (name: string) => (args: { type?: string } | undefi
 const DIFF_CUSTOM_TYPE = "git-commit-diff";
 const CHECKPOINT_MARKER_PREFIX = "[pi-git-commit checkpoint #";
 const CHECKPOINT_MARKER_RE = /^\[pi-git-commit checkpoint #(\d+)\]$/;
+const AMEND_DIFF_CUSTOM_TYPE = "git-amend-diff";
+const AMEND_CHECKPOINT_MARKER_PREFIX = "[pi-git-amend checkpoint #";
+const AMEND_CHECKPOINT_MARKER_RE = /^\[pi-git-amend checkpoint #(\d+)\]$/;
+const NO_AMEND_CHANGES_NOTE = "No file changes since the last commit.";
 const DIFF_PREVIEW_LINES = 2000;
 const DIFF_PREVIEW_BYTES = 50 * 1024;
 const STAT_PREVIEW_LINES = 100;
@@ -21,7 +25,9 @@ export default function (pi: ExtensionAPI) {
   let stopInputListener: (() => void) | undefined;
   let commitStagedOnly = false;
   const queuedCommits = new Map<number, { stagedOnly: boolean }>();
+  const queuedAmends = new Map<number, { critique: string }>();
   let nextCommitId = 0;
+  let nextAmendId = 0;
 
   const PREFIXES = new Set(["sudo", "env", "command", "nohup", "nice", "time", "exec", "builtin", "doas", "eval", "timeout", "runuser", "pkexec", "setsid", "ionice", "strace", "ltrace", "flock", "unshare", "nsenter", "setpriv", "fakeroot", "busybox", "stdbuf", "watch", "run0", "systemd-run"]);
   const CONTROL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "case", "select"]);
@@ -295,6 +301,21 @@ export default function (pi: ExtensionAPI) {
     return { prompt, details };
   };
 
+  const buildAmendReview = (diffStdout: string, statStdout: string, lastMessage: string, critique: string) => {
+    const stat = capStat(statStdout);
+    const hasChanges = diffStdout.trim().length > 0;
+    const diff = hasChanges ? previewDiff(diffStdout) : undefined;
+    const diffFence = fenceFor(diff ?? "");
+    const changes = !hasChanges ? NO_AMEND_CHANGES_NOTE : diff === undefined ? DIFF_OMITTED_NOTE : `${diffFence}diff\n${diff}\n${diffFence}`;
+    const messageFence = fenceFor(lastMessage);
+    const statFence = fenceFor(stat);
+    const prompt = `DO NOT use bash for git. Use ONLY the \`git_amend\` tool.\n\nThe user wants the last commit amended.\n\nUser critique:\n\n${critique}\n\nCurrent last commit message:\n\n${messageFence}text\n${lastMessage}\n${messageFence}\n\nChanges since the last commit:\n\n${statFence}\n${stat}\n${statFence}\n\n${changes}\n\nChoose the right type (FIX, IMPROVE, or NEW), write a corrected message that answers the critique, and call \`git_amend\` with it. The tool stages all changes and folds them into the last commit, and refreshes the commit timestamp to now.`;
+    const details = diff === undefined
+      ? { stat, message: lastMessage, critique, note: hasChanges ? DIFF_OMITTED_NOTE : NO_AMEND_CHANGES_NOTE }
+      : { diff, stat, message: lastMessage, critique };
+    return { prompt, details };
+  };
+
   const messageText = (content: unknown): string => {
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
@@ -304,8 +325,8 @@ export default function (pi: ExtensionAPI) {
     }).join("");
   };
 
-  const checkpointIdFrom = (content: unknown): number | undefined => {
-    const match = CHECKPOINT_MARKER_RE.exec(messageText(content).trim());
+  const checkpointIdFrom = (content: unknown, pattern: RegExp): number | undefined => {
+    const match = pattern.exec(messageText(content).trim());
     return match ? Number(match[1]) : undefined;
   };
 
@@ -321,8 +342,9 @@ export default function (pi: ExtensionAPI) {
     clearStopListener();
   };
 
-  const cancelQueuedCommits = () => {
+  const cancelQueuedCheckpoints = () => {
     queuedCommits.clear();
+    queuedAmends.clear();
   };
 
   const sendFlowStopped = (stoppedBy: string) => {
@@ -335,11 +357,11 @@ export default function (pi: ExtensionAPI) {
   const watchForEscape = (ctx: ExtensionContext) => {
     clearStopListener();
     stopInputListener = ctx.ui.onTerminalInput((data) => {
-      if (!commitFlowActive && !amendFlowActive && queuedCommits.size === 0) return undefined;
+      if (!commitFlowActive && !amendFlowActive && queuedCommits.size === 0 && queuedAmends.size === 0) return undefined;
       if (!matchesKey(data, "escape")) return undefined;
-      const flowName = amendFlowActive ? "Amend" : "Commit";
+      const flowName = amendFlowActive || queuedAmends.size > 0 ? "Amend" : "Commit";
       closeFlows();
-      cancelQueuedCommits();
+      cancelQueuedCheckpoints();
       ctx.ui.setWorkingMessage();
       sendFlowStopped("by pressing escape");
       ctx.ui.notify(`${flowName} flow stopped.`, "info");
@@ -455,7 +477,45 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_start", async (event, ctx) => {
     const message = event.message;
     if (message.role !== "user") return;
-    const id = checkpointIdFrom(message.content);
+    const amendId = checkpointIdFrom(message.content, AMEND_CHECKPOINT_MARKER_RE);
+    if (amendId !== undefined) {
+      const pendingAmend = queuedAmends.get(amendId);
+      if (!pendingAmend) {
+        Object.assign(message, { role: "custom", customType: AMEND_DIFF_CUSTOM_TYPE, content: "A queued amend checkpoint was cancelled.", display: false });
+        return;
+      }
+      queuedAmends.delete(amendId);
+
+      const addResult = await pi.exec("git", ["add", "."], execOptions(ctx.signal));
+      if (addResult.code !== 0) {
+        ctx.ui.notify(`git add failed: ${addResult.stderr}`, "error");
+        Object.assign(message, { role: "custom", customType: AMEND_DIFF_CUSTOM_TYPE, content: `Amend checkpoint skipped: git add failed. ${addResult.stderr}`, display: false });
+        return;
+      }
+
+      const diffResult = await pi.exec("git", ["diff", "--staged"], execOptions(ctx.signal));
+      if (diffResult.code !== 0) {
+        ctx.ui.notify(`git diff failed: ${diffResult.stderr}`, "error");
+        Object.assign(message, { role: "custom", customType: AMEND_DIFF_CUSTOM_TYPE, content: `Amend checkpoint skipped: git diff failed. ${diffResult.stderr}`, display: false });
+        return;
+      }
+
+      const statResult = await pi.exec("git", ["diff", "--staged", "--stat"], execOptions(ctx.signal));
+      const logResult = await pi.exec("git", ["log", "-1", "--format=%B"], execOptions(ctx.signal));
+      if (logResult.code !== 0) {
+        ctx.ui.notify(`git log failed: ${logResult.stderr}`, "error");
+        Object.assign(message, { role: "custom", customType: AMEND_DIFF_CUSTOM_TYPE, content: `Amend checkpoint skipped: git log failed. ${logResult.stderr}`, display: false });
+        return;
+      }
+
+      const { prompt, details } = buildAmendReview(diffResult.stdout, statResult.code === 0 ? statResult.stdout.trim() : "", logResult.stdout.trim(), pendingAmend.critique);
+      amendFlowActive = true;
+      watchForEscape(ctx);
+      Object.assign(message, { role: "custom", customType: AMEND_DIFF_CUSTOM_TYPE, content: prompt, display: true, details });
+      return;
+    }
+
+    const id = checkpointIdFrom(message.content, CHECKPOINT_MARKER_RE);
     if (id === undefined) return;
     const pending = queuedCommits.get(id);
     if (!pending) {
@@ -494,48 +554,62 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_before_settle", () => {
-    if (queuedCommits.size > 0) cancelQueuedCommits();
+    if (queuedCommits.size > 0 || queuedAmends.size > 0) cancelQueuedCheckpoints();
   });
 
   pi.on("session_start", () => {
     gitBlocked = true;
     closeFlows();
-    cancelQueuedCommits();
+    cancelQueuedCheckpoints();
   });
 
-  pi.registerMessageRenderer(DIFF_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const details = message.details as { diff?: string; stat?: string; note?: string } | undefined;
-    const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
-    let clickExpanded = expanded;
-    const populate = () => {
-      box.clear();
-      box.addChild(new Text(theme.fg("accent", "Staged changes"), 0, 0));
-      if (clickExpanded) {
-        if (details?.diff) {
-          box.addChild(new Text(renderDiff(details.diff), 0, 0));
+  type ReviewDetails = { diff?: string; stat?: string; note?: string; message?: string; critique?: string };
+
+  const registerReviewRenderer = (customType: string, title: string, head: (details: ReviewDetails | undefined, theme: Theme) => string[]) => {
+    pi.registerMessageRenderer(customType, (message, { expanded, outputPad }, theme) => {
+      const details = message.details as ReviewDetails | undefined;
+      const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
+      let clickExpanded = expanded;
+      const populate = () => {
+        box.clear();
+        box.addChild(new Text(theme.fg("accent", title), 0, 0));
+        for (const line of head(details, theme)) {
+          box.addChild(new Text(line, 0, 0));
+        }
+        if (clickExpanded) {
+          if (details?.diff) {
+            box.addChild(new Text(renderDiff(details.diff), 0, 0));
+          } else {
+            if (details?.stat) {
+              box.addChild(new Text(details.stat, 0, 0));
+            }
+            if (details?.note) {
+              box.addChild(new Text(theme.fg("dim", details.note), 0, 0));
+            }
+          }
         } else {
           if (details?.stat) {
             box.addChild(new Text(details.stat, 0, 0));
           }
-          if (details?.note) {
-            box.addChild(new Text(theme.fg("dim", details.note), 0, 0));
-          }
+          box.addChild(new Text(theme.fg("dim", `(${keyHint("app.tools.expand", "to expand")})`), 0, 0));
         }
-      } else {
-        if (details?.stat) {
-          box.addChild(new Text(details.stat, 0, 0));
-        }
-        box.addChild(new Text(theme.fg("dim", `(${keyHint("app.tools.expand", "to expand")})`), 0, 0));
-      }
-    };
-    populate();
-    return new MouseRegion(box, (event) => {
-      if (event.type !== "click" || event.button !== "left") return undefined;
-      clickExpanded = !clickExpanded;
+      };
       populate();
-      return { handled: true };
+      return new MouseRegion(box, (event) => {
+        if (event.type !== "click" || event.button !== "left") return undefined;
+        clickExpanded = !clickExpanded;
+        populate();
+        return { handled: true };
+      });
     });
-  });
+  };
+
+  registerReviewRenderer(DIFF_CUSTOM_TYPE, "Staged changes", () => []);
+
+  registerReviewRenderer(AMEND_DIFF_CUSTOM_TYPE, "Amend review", (details, theme) => [
+    ...(details?.message ? [theme.fg("muted", `Current message: ${details.message}`)] : []),
+    ...(details?.critique ? [theme.fg("muted", `Critique: ${details.critique}`)] : []),
+  ]);
 
   pi.registerCommand("commit", {
     description: "Stage files and show a diff for the agent to commit (--staged commits only the index)",
@@ -552,7 +626,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (ctx.signal !== undefined) {
-        if (amendFlowActive) {
+        if (amendFlowActive || queuedAmends.size > 0) {
           ctx.ui.notify("An amend flow is already in progress. Run /stop-commit first.", "warning");
           return;
         }
@@ -564,7 +638,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Commit checkpoint queued (${queuedCommits.size} waiting). It runs when the queued work ahead of it finishes.`, "info");
         return;
       }
-      if (commitFlowActive || amendFlowActive) {
+      if (commitFlowActive || amendFlowActive || queuedAmends.size > 0) {
         ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
         return;
       }
@@ -623,9 +697,9 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("stop-commit requires interactive mode", "error");
         return;
       }
-      const flowWasActive = commitFlowActive || amendFlowActive || queuedCommits.size > 0;
+      const flowWasActive = commitFlowActive || amendFlowActive || queuedCommits.size > 0 || queuedAmends.size > 0;
       closeFlows();
-      cancelQueuedCommits();
+      cancelQueuedCheckpoints();
       if (flowWasActive) {
         ctx.ui.setWorkingMessage();
         sendFlowStopped("with /stop-commit");
@@ -637,14 +711,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("amend", {
-    description: "Send your critique of the last commit message to the agent for git_amend (stages all changes and refreshes the commit timestamp)",
+    description: "Review the diff since the last commit and send your critique to the agent for git_amend (stages all changes and refreshes the commit timestamp)",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("amend requires interactive mode", "error");
-        return;
-      }
-      if (commitFlowActive || amendFlowActive || queuedCommits.size > 0) {
-        ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
         return;
       }
       const critique = args.trim();
@@ -652,17 +722,57 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Add a critique of the commit message: /amend <what to change>", "error");
         return;
       }
+      if (ctx.signal !== undefined) {
+        if (commitFlowActive || queuedCommits.size > 0) {
+          ctx.ui.notify("A commit flow is already in progress. Run /stop-commit first.", "warning");
+          return;
+        }
+        const id = nextAmendId;
+        nextAmendId += 1;
+        queuedAmends.set(id, { critique });
+        pi.sendUserMessage(`${AMEND_CHECKPOINT_MARKER_PREFIX}${id}]`, { deliverAs: "followUp" });
+        watchForEscape(ctx);
+        ctx.ui.notify(`Amend checkpoint queued (${queuedAmends.size} waiting). It runs when the queued work ahead of it finishes.`, "info");
+        return;
+      }
+      if (commitFlowActive || amendFlowActive || queuedCommits.size > 0 || queuedAmends.size > 0) {
+        ctx.ui.notify("A commit or amend flow is already in progress. Run /stop-commit first.", "warning");
+        return;
+      }
       amendFlowActive = true;
       watchForEscape(ctx);
+
+      const execGit = async (label: string, args: string[]) => {
+        const result = await pi.exec("git", args);
+        if (result.code !== 0) {
+          ctx.ui.notify(`${label} failed: ${result.stderr}`, "error");
+          closeFlows();
+          return undefined;
+        }
+        return result;
+      };
 
       try {
         await ctx.ui.setWorkingMessage("Waiting for queued messages to complete...");
         await ctx.waitForIdle();
         if (!amendFlowActive) return;
 
-        const prompt = `DO NOT use bash for git. Use ONLY the \`git_amend\` tool.\n\nThe user wants the last commit amended.\n\nUser critique: ${critique}\n\nChoose the right type (FIX, IMPROVE, or NEW), write a corrected message that answers the critique, and call \`git_amend\` with it. The tool stages all changes and folds them into the last commit, and refreshes the commit timestamp to now.`;
+        await ctx.ui.setWorkingMessage("Staging files...");
+        const addResult = await execGit("git add", ["add", "."]);
+        if (!addResult || !amendFlowActive) return;
+
+        await ctx.ui.setWorkingMessage("Getting diff...");
+        const diffResult = await execGit("git diff", ["diff", "--staged"]);
+        if (!diffResult || !amendFlowActive) return;
+
+        const statResult = await pi.exec("git", ["diff", "--staged", "--stat"]);
+        if (!amendFlowActive) return;
+        const logResult = await execGit("git log", ["log", "-1", "--format=%B"]);
+        if (!logResult || !amendFlowActive) return;
+
+        const { prompt, details } = buildAmendReview(diffResult.stdout, statResult.code === 0 ? statResult.stdout.trim() : "", logResult.stdout.trim(), critique);
         pi.sendMessage(
-          { customType: "git-amend-request", content: prompt, display: false },
+          { customType: AMEND_DIFF_CUSTOM_TYPE, content: prompt, display: true, details },
           { deliverAs: "followUp", triggerTurn: true },
         );
       } finally {

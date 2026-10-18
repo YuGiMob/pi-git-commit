@@ -55,6 +55,7 @@ describe("commit extension", () => {
   let pi: any;
   let capturedTools: any[] = [];
   let capturedMessageRenderer: any;
+  let capturedAmendMessageRenderer: any;
   let capturedCommands: any[];
   let toolCallHandler: ((event: any) => Promise<any>) | undefined;
   let sessionStartHandler: (() => void) | undefined;
@@ -71,6 +72,7 @@ describe("commit extension", () => {
     capturedCommands = [];
     capturedTools = [];
     capturedMessageRenderer = undefined;
+    capturedAmendMessageRenderer = undefined;
     toolCallHandler = undefined;
     sessionStartHandler = undefined;
     messageStartHandler = undefined;
@@ -87,6 +89,7 @@ describe("commit extension", () => {
       }),
       registerMessageRenderer: vi.fn((customType: string, renderer: any) => {
         if (customType === "git-commit-diff") capturedMessageRenderer = renderer;
+        if (customType === "git-amend-diff") capturedAmendMessageRenderer = renderer;
       }),
       registerCommand: vi.fn((name: string, cmd: any) => {
         capturedCommands.push({ name, cmd });
@@ -970,10 +973,12 @@ EOF`;
     });
   });
 
-  describe("queued commit checkpoints", () => {
+  describe("queued checkpoints", () => {
     const commitCommand = () => capturedCommands.find((c: any) => c.name === "commit");
     const stopCommand = () => capturedCommands.find((c: any) => c.name === "stop-commit");
+    const amendCommand = () => capturedCommands.find((c: any) => c.name === "amend");
     const checkpoint = (id: number): any => ({ role: "user", content: [{ type: "text", text: `[pi-git-commit checkpoint #${id}]` }] });
+    const amendCheckpoint = (id: number): any => ({ role: "user", content: [{ type: "text", text: `[pi-git-amend checkpoint #${id}]` }] });
     let terminalInputHandler: ((data: string) => unknown) | undefined;
 
     function createStreamingCtx() {
@@ -1132,14 +1137,98 @@ EOF`;
 
     it("rejects a queued commit while an amend flow is active", async () => {
       pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "", stderr: "" });
-      const amendCommand = capturedCommands.find((c: any) => c.name === "amend");
-      await amendCommand.cmd.handler("better message", createStreamingCtx());
+      const amendCtx = { ...createStreamingCtx(), signal: undefined };
+      await amendCommand()!.cmd.handler("better message", amendCtx);
       const ctx = createStreamingCtx();
 
       await commitCommand()!.cmd.handler("", ctx);
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("amend flow is already in progress"), "warning");
       expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    });
+
+    it("queues a visible amend checkpoint while the agent is streaming", async () => {
+      const ctx = createStreamingCtx();
+
+      await amendCommand()!.cmd.handler("mention the retry loop", ctx);
+
+      expect(pi.exec).not.toHaveBeenCalled();
+      expect(pi.sendUserMessage).toHaveBeenCalledWith("[pi-git-amend checkpoint #0]", { deliverAs: "followUp" });
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Amend checkpoint queued"), "info");
+    });
+
+    it("turns a surfaced amend checkpoint into the amend review", async () => {
+      pi.exec = vi.fn()
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "diff --git a/x b/x\n+hello", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "1 file changed, 1 insertion(+)", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "FIX: old message\n", stderr: "" });
+      const ctx = createStreamingCtx();
+      await amendCommand()!.cmd.handler("mention the retry loop", ctx);
+      const message = amendCheckpoint(0);
+
+      await messageStartHandler!({ message }, ctx);
+
+      expect(message.role).toBe("custom");
+      expect(message.customType).toBe("git-amend-diff");
+      expect(message.display).toBe(true);
+      expect(message.content).toContain("mention the retry loop");
+      expect(message.content).toContain("FIX: old message");
+      expect(message.content).toContain("+hello");
+      expect(message.details).toEqual({
+        diff: "diff --git a/x b/x\n+hello",
+        stat: "1 file changed, 1 insertion(+)",
+        message: "FIX: old message",
+        critique: "mention the retry loop",
+      });
+
+      pi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "", stderr: "" });
+      const tool = capturedTools.find((t: any) => t.name === "git_amend");
+      const amended = await tool.execute("call-1", { type: "FIX", message: "mention the retry loop" }, undefined, vi.fn(), {});
+      expect(amended.isError).toBeFalsy();
+      expect(pi.exec.mock.calls.map((call: any[]) => call[1])).toContainEqual(["commit", "--amend", "-m", "FIX: mention the retry loop", "--date=now"]);
+    });
+
+    it("opens the amend review when there are no file changes", async () => {
+      pi.exec = vi.fn()
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
+        .mockResolvedValueOnce({ code: 0, stdout: "FIX: old message", stderr: "" });
+      const ctx = createStreamingCtx();
+      await amendCommand()!.cmd.handler("tighten the wording", ctx);
+      const message = amendCheckpoint(0);
+
+      await messageStartHandler!({ message }, ctx);
+
+      expect(message.customType).toBe("git-amend-diff");
+      expect(message.content).toContain("No file changes since the last commit.");
+      expect(message.details.note).toContain("No file changes");
+    });
+
+    it("neutralizes a queued amend checkpoint cancelled by /stop-commit", async () => {
+      const ctx = createStreamingCtx();
+      await amendCommand()!.cmd.handler("mention the retry loop", ctx);
+
+      const stopCtx = createStreamingCtx();
+      await stopCommand()!.cmd.handler("", stopCtx);
+
+      const message = amendCheckpoint(0);
+      await messageStartHandler!({ message }, ctx);
+
+      expect(pi.exec).not.toHaveBeenCalled();
+      expect(message.role).toBe("custom");
+      expect(message.content).toContain("cancelled");
+    });
+
+    it("rejects a queued commit while an amend checkpoint is pending", async () => {
+      await amendCommand()!.cmd.handler("mention the retry loop", createStreamingCtx());
+      const ctx = createStreamingCtx();
+
+      await commitCommand()!.cmd.handler("", ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("amend flow is already in progress"), "warning");
+      expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
     });
 
     it("leaves unrelated user messages untouched", async () => {
@@ -1212,6 +1301,53 @@ EOF`;
       );
       const text = box.render(80).join("\n");
       expect(text).toContain("1 file changed");
+      expect(text).toContain("[Diff omitted: over budget]");
+    });
+  });
+
+  describe("git-amend-diff message renderer", () => {
+    const theme = {
+      bg: (_name: string, text: string) => text,
+      fg: (_name: string, text: string) => text,
+    };
+    const message = {
+      content: "Amend review",
+      details: { diff: "diff --git a/x b/x\n+hello", stat: "1 file changed, 1 insertion(+)", message: "FIX: old message", critique: "mention the retry loop" },
+    };
+
+    it("registers a renderer for git-amend-diff", () => {
+      expect(capturedAmendMessageRenderer).toBeDefined();
+    });
+
+    it("shows the last commit message, critique and stat when collapsed", () => {
+      const box = capturedAmendMessageRenderer(message, { expanded: false, outputPad: 0 }, theme);
+      const text = box.render(80).join("\n");
+      expect(text).toContain("Amend review");
+      expect(text).toContain("FIX: old message");
+      expect(text).toContain("mention the retry loop");
+      expect(text).toContain("1 file changed, 1 insertion(+)");
+      expect(text).toContain("app.tools.expand");
+      expect(text).not.toContain("diff --git");
+    });
+
+    it("shows the diff when expanded", () => {
+      const box = capturedAmendMessageRenderer(message, { expanded: true, outputPad: 0 }, theme);
+      const text = box.render(80).join("\n");
+      expect(text).toContain("FIX: old message");
+      expect(text).toContain("mention the retry loop");
+      expect(text).toContain("diff --git a/x b/x");
+      expect(text).toContain("+hello");
+    });
+
+    it("shows the omission note when the diff was too large to attach", () => {
+      const box = capturedAmendMessageRenderer(
+        { content: "Amend review", details: { stat: "1 file changed", message: "FIX: old message", critique: "mention the retry loop", note: "[Diff omitted: over budget]" } },
+        { expanded: true, outputPad: 0 },
+        theme,
+      );
+      const text = box.render(80).join("\n");
+      expect(text).toContain("FIX: old message");
+      expect(text).toContain("mention the retry loop");
       expect(text).toContain("[Diff omitted: over budget]");
     });
   });
@@ -1329,7 +1465,7 @@ EOF`;
       resolveIdle();
       await amendPromise;
       expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
-        expect.objectContaining({ customType: "git-amend-request" }),
+        expect.objectContaining({ customType: "git-amend-diff" }),
         expect.anything(),
       );
       expect(fakePi.setActiveTools).not.toHaveBeenCalled();
@@ -1378,7 +1514,7 @@ EOF`;
       await amendPromise;
 
       expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
-        expect.objectContaining({ customType: "git-amend-request" }),
+        expect.objectContaining({ customType: "git-amend-diff" }),
         expect.anything(),
       );
       expect(fakePi.sendMessage).toHaveBeenCalledWith(
@@ -1438,12 +1574,13 @@ EOF`;
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("already in progress"), "warning");
       expect(fakePi.sendMessage).not.toHaveBeenCalledWith(
-        expect.objectContaining({ customType: "git-amend-request" }),
+        expect.objectContaining({ customType: "git-amend-diff" }),
         expect.anything(),
       );
     });
 
     it("rejects /commit while an amend flow is active", async () => {
+      fakePi.exec = vi.fn().mockResolvedValue({ code: 0, stdout: "", stderr: "" });
       await amendCommand.handler("better message", createCtx());
       const ctx = createCtx();
 
@@ -1523,21 +1660,26 @@ EOF`;
       expect(result.content[0].text).toContain("No amend flow");
     });
 
-    it("sends only the critique to the agent", async () => {
+    it("sends the last commit message, diff and critique to the agent", async () => {
       seedCommit("a.txt", "seed");
+      fs.writeFileSync(path.join(tempDir, "a.txt"), "changed");
       await startAmendFlow("the type should be IMPROVE");
 
       expect(fakePi.sendMessage).toHaveBeenCalledWith(
         expect.objectContaining({
-          display: false,
+          customType: "git-amend-diff",
+          display: true,
           content: expect.stringContaining("the type should be IMPROVE"),
         }),
         expect.objectContaining({ deliverAs: "followUp", triggerTurn: true }),
       );
-      const request = fakePi.sendMessage.mock.calls[0][0] as { content: string };
-      expect(request.content).not.toContain("seed");
+      const request = fakePi.sendMessage.mock.calls[0][0] as { content: string; details: { diff?: string; message?: string; critique?: string } };
+      expect(request.content).toContain("seed");
+      expect(request.content).toContain("+changed");
       expect(request.content).toContain("git_amend");
-      expect(fakePi.exec).not.toHaveBeenCalled();
+      expect(request.details.message).toBe("seed");
+      expect(request.details.critique).toBe("the type should be IMPROVE");
+      expect(request.details.diff).toContain("+changed");
     });
 
     it("amends the last commit message with the TYPE prefix and closes the flow", async () => {
@@ -1661,11 +1803,18 @@ EOF`;
       expect(result.content[0].text).toContain("No amend flow");
     });
 
-    it("opens the flow without running any git command", async () => {
+    it("stages the working tree before showing the amend review", async () => {
+      seedCommit("a2.txt", "seed");
+      fs.writeFileSync(path.join(tempDir, "a2.txt"), "changed");
       const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
+
       await amendCommand.handler("anything", ctx);
-      expect(fakePi.exec).not.toHaveBeenCalled();
+
+      expect(fakePi.exec).toHaveBeenCalled();
       expect(fakePi.sendMessage).toHaveBeenCalledTimes(1);
+      const request = fakePi.sendMessage.mock.calls[0][0] as { details: { diff?: string } };
+      expect(request.details.diff).toContain("+changed");
+      expect(runGit(["diff", "--cached", "--name-only"]).stdout).toContain("a2.txt");
     });
 
     it("aborts a pending amend flow via /stop-commit", async () => {
