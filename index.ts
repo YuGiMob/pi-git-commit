@@ -309,10 +309,19 @@ export default function (pi: ExtensionAPI) {
     const changes = !hasChanges ? NO_AMEND_CHANGES_NOTE : diff === undefined ? DIFF_OMITTED_NOTE : `${diffFence}diff\n${diff}\n${diffFence}`;
     const messageFence = fenceFor(lastMessage);
     const statFence = fenceFor(stat);
-    const prompt = `DO NOT use bash for git. Use ONLY the \`git_amend\` tool.\n\nThe user wants the last commit amended.\n\nUser critique:\n\n${critique}\n\nCurrent last commit message:\n\n${messageFence}text\n${lastMessage}\n${messageFence}\n\nChanges since the last commit:\n\n${statFence}\n${stat}\n${statFence}\n\n${changes}\n\nChoose the right type (FIX, IMPROVE, or NEW), write a corrected message that answers the critique, and call \`git_amend\` with it. The tool stages all changes and folds them into the last commit, and refreshes the commit timestamp to now.`;
-    const details = diff === undefined
-      ? { stat, message: lastMessage, critique, note: hasChanges ? DIFF_OMITTED_NOTE : NO_AMEND_CHANGES_NOTE }
-      : { diff, stat, message: lastMessage, critique };
+    const direction = critique
+      ? `User critique:\n\n${critique}`
+      : hasChanges
+        ? "No critique was given. The newer changes are staged and will be folded into the last commit, so write a message that describes the joint result of the original commit and the newer changes."
+        : "No critique was given. Rephrase the last commit message without changing its meaning.";
+    const summary = hasChanges ? "Fold the newer changes into this commit and describe the joint result" : "Rephrase this message";
+    const prompt = `DO NOT use bash for git. Use ONLY the \`git_amend\` tool.\n\nThe user wants the last commit amended.\n\n${direction}\n\nCurrent last commit message:\n\n${messageFence}text\n${lastMessage}\n${messageFence}\n\nChanges since the last commit:\n\n${statFence}\n${stat}\n${statFence}\n\n${changes}\n\nChoose the right type (FIX, IMPROVE, or NEW), write the corrected message and call \`git_amend\` with it. The tool stages all changes and folds them into the last commit, and refreshes the commit timestamp to now.`;
+    const details = {
+      stat,
+      message: lastMessage,
+      ...(critique ? { critique } : { summary }),
+      ...(diff === undefined ? { note: hasChanges ? DIFF_OMITTED_NOTE : NO_AMEND_CHANGES_NOTE } : { diff }),
+    };
     return { prompt, details };
   };
 
@@ -563,7 +572,7 @@ export default function (pi: ExtensionAPI) {
     cancelQueuedCheckpoints();
   });
 
-  type ReviewDetails = { diff?: string; stat?: string; note?: string; message?: string; critique?: string };
+  type ReviewDetails = { diff?: string; stat?: string; note?: string; message?: string; critique?: string; summary?: string };
 
   const registerReviewRenderer = (customType: string, title: string, head: (details: ReviewDetails | undefined, theme: Theme) => string[]) => {
     pi.registerMessageRenderer(customType, (message, { expanded, outputPad }, theme) => {
@@ -609,6 +618,7 @@ export default function (pi: ExtensionAPI) {
   registerReviewRenderer(AMEND_DIFF_CUSTOM_TYPE, "Amend review", (details, theme) => [
     ...(details?.message ? [theme.fg("muted", `Current message: ${details.message}`)] : []),
     ...(details?.critique ? [theme.fg("muted", `Critique: ${details.critique}`)] : []),
+    ...(!details?.critique && details?.summary ? [theme.fg("muted", details.summary)] : []),
   ]);
 
   pi.registerCommand("commit", {
@@ -711,17 +721,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("amend", {
-    description: "Review the diff since the last commit and send your critique to the agent for git_amend (stages all changes and refreshes the commit timestamp)",
+    description: "Review the last commit and send an optional critique to the agent for git_amend (stages all changes and refreshes the commit timestamp)",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("amend requires interactive mode", "error");
         return;
       }
       const critique = args.trim();
-      if (!critique) {
-        ctx.ui.notify("Add a critique of the commit message: /amend <what to change>", "error");
-        return;
-      }
       if (ctx.signal !== undefined) {
         if (commitFlowActive || queuedCommits.size > 0) {
           ctx.ui.notify("A commit flow is already in progress. Run /stop-commit first.", "warning");

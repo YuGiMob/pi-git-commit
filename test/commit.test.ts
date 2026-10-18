@@ -1157,6 +1157,15 @@ EOF`;
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Amend checkpoint queued"), "info");
     });
 
+    it("queues an amend checkpoint without a critique", async () => {
+      const ctx = createStreamingCtx();
+
+      await amendCommand()!.cmd.handler("", ctx);
+
+      expect(pi.sendUserMessage).toHaveBeenCalledWith("[pi-git-amend checkpoint #0]", { deliverAs: "followUp" });
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Amend checkpoint queued"), "info");
+    });
+
     it("turns a surfaced amend checkpoint into the amend review", async () => {
       pi.exec = vi.fn()
         .mockResolvedValueOnce({ code: 0, stdout: "", stderr: "" })
@@ -1349,6 +1358,16 @@ EOF`;
       expect(text).toContain("FIX: old message");
       expect(text).toContain("mention the retry loop");
       expect(text).toContain("[Diff omitted: over budget]");
+    });
+
+    it("shows the summary when there is no critique", () => {
+      const box = capturedAmendMessageRenderer(
+        { content: "Amend review", details: { stat: "1 file changed", message: "FIX: old message", summary: "Rephrase this message" } },
+        { expanded: false, outputPad: 0 },
+        theme,
+      );
+      const text = box.render(80).join("\n");
+      expect(text).toContain("Rephrase this message");
     });
   });
 
@@ -1791,16 +1810,35 @@ EOF`;
       expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: real message");
     });
 
-    it("opens no flow when /amend is called without a critique", async () => {
+    it("rephrases the last commit message when /amend is called without a critique and no changes", async () => {
       seedCommit("i.txt", "seed");
       const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
-      await amendCommand.handler("", ctx);
-      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("/amend"), "error");
-      expect(fakePi.sendMessage).not.toHaveBeenCalled();
 
-      const result = await tool.execute("call-1", { type: "FIX", message: "no flow" }, undefined, vi.fn(), {});
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("No amend flow");
+      await amendCommand.handler("", ctx);
+
+      expect(ctx.ui.notify).not.toHaveBeenCalled();
+      expect(fakePi.sendMessage).toHaveBeenCalledTimes(1);
+      const request = fakePi.sendMessage.mock.calls[0][0] as { content: string; details: { summary?: string } };
+      expect(request.content).toContain("Rephrase the last commit message");
+      expect(request.details.summary).toContain("Rephrase");
+
+      const result = await tool.execute("call-1", { type: "FIX", message: "clearer message" }, undefined, vi.fn(), {});
+      expect(result.isError).toBeFalsy();
+      expect(runGit(["log", "-1", "--format=%s"]).stdout.trim()).toBe("FIX: clearer message");
+    });
+
+    it("communicates a joint commit when /amend is called without a critique and there are changes", async () => {
+      seedCommit("i2.txt", "seed");
+      fs.writeFileSync(path.join(tempDir, "i2.txt"), "changed");
+      const ctx = { hasUI: true, ui: { notify: vi.fn(), setWorkingMessage: vi.fn(), onTerminalInput: vi.fn(() => () => {}) }, waitForIdle: vi.fn() };
+
+      await amendCommand.handler("", ctx);
+
+      expect(fakePi.sendMessage).toHaveBeenCalledTimes(1);
+      const request = fakePi.sendMessage.mock.calls[0][0] as { content: string; details: { summary?: string; diff?: string } };
+      expect(request.content).toContain("joint result");
+      expect(request.details.summary).toContain("Fold the newer changes");
+      expect(request.details.diff).toContain("+changed");
     });
 
     it("stages the working tree before showing the amend review", async () => {
